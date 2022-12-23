@@ -2,6 +2,10 @@ module html
 
 import strings
 
+const (
+	tag_len = 200
+)
+
 enum CloseTagType {
 	in_name
 	new_tag
@@ -37,7 +41,7 @@ pub fn (tag Tag) text() string {
 	if tag.name.len >= 2 && tag.name[..2] == 'br' {
 		return '\n'
 	}
-	mut text_str := strings.new_builder(200)
+	mut text_str := strings.new_builder(tag_len)
 	text_str.write_string(tag.content.replace('\n', ''))
 	for child in tag.children {
 		text_str.write_string(child.text())
@@ -46,7 +50,7 @@ pub fn (tag Tag) text() string {
 }
 
 pub fn (tag &Tag) str() string {
-	mut html_str := strings.new_builder(200)
+	mut html_str := strings.new_builder(tag_len)
 	html_str.write_string('<${tag.name}')
 	for key, value in tag.attributes {
 		html_str.write_string(' ${key}')
