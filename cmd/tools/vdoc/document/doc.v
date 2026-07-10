@@ -320,6 +320,7 @@ pub fn (mut d Doc) stmt(mut stmt ast.Stmt, filename string) !DocNode {
 			return error('invalid stmt type to document')
 		}
 	}
+
 	included := node.name in d.filter_symbol_names || node.parent_name in d.filter_symbol_names
 	if d.filter_symbol_names.len != 0 && !included {
 		return error('not included in the list of symbol names')
@@ -357,6 +358,14 @@ pub fn (mut d Doc) file_ast(mut file_ast ast.File) map[string]DocNode {
 					preceding_comments << comment
 				}
 				continue
+			} else if stmt.expr is ast.IfExpr && stmt.expr.is_comptime {
+				comments := ast_comments_to_doc_comments(stmt.expr.post_comments)
+				if collect_post_module_comments {
+					post_module_comments << comments
+				} else {
+					preceding_comments << comments
+				}
+				continue
 			}
 		}
 		// TODO: Fetch head comment once
@@ -375,11 +384,30 @@ pub fn (mut d Doc) file_ast(mut file_ast ast.File) map[string]DocNode {
 		}
 		if collect_post_module_comments {
 			if post_module_comments.len > 0 {
+				// Attributes are consumed before the declaration, so anchor the
+				// adjacency checks on the first attribute line when present.
+				stmt_line := stmt_doc_anchor_line(stmt)
 				last_post_module_comment := post_module_comments[post_module_comments.len - 1]
-				if stmt is ast.Import || last_post_module_comment.pos.line_nr + 1 < stmt.pos.line_nr {
+				if stmt is ast.Import || last_post_module_comment.pos.last_line + 1 < stmt_line {
+					// None of the comments are directly above the following statement,
+					// so treat all of them as the module's overview comment.
 					d.head.comments << post_module_comments
 				} else {
-					preceding_comments << post_module_comments
+					// The comments directly above the following statement (with no
+					// blank line separating them) document that statement, while an
+					// earlier block, separated by a blank line, is the module overview.
+					mut split_idx := post_module_comments.len
+					mut next_line := stmt_line
+					for split_idx > 0 {
+						cmt := post_module_comments[split_idx - 1]
+						if cmt.pos.last_line + 1 < next_line {
+							break
+						}
+						next_line = cmt.pos.line_nr
+						split_idx--
+					}
+					d.head.comments << post_module_comments[..split_idx]
+					preceding_comments << post_module_comments[split_idx..]
 				}
 				post_module_comments = []
 			}
@@ -507,9 +535,12 @@ pub fn (mut d Doc) file_asts(mut file_asts []ast.File) ! {
 		}
 		if d.with_head && i == 0 {
 			mut module_name := file_ast.mod.name
-			// if module_name != 'main' && d.parent_mod_name.len > 0 {
-			// 	module_name = d.parent_mod_name + '.' + module_name
-			// }
+			if module_name != file_ast.mod.short_name
+				&& !module_name.ends_with('.${file_ast.mod.short_name}') {
+				// qualify_module resolved by path instead of module name,
+				// use the short name from the source
+				module_name = file_ast.mod.short_name
+			}
 			d.head = DocNode{
 				name:    module_name
 				content: 'module ${module_name}'

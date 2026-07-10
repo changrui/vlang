@@ -40,8 +40,7 @@ fn main() {
 	for targ in args_after {
 		if os.is_dir(targ) {
 			// Fetch all tests from the directory
-			files, skip_files := ctx.should_test_dir(targ.trim_right(os.path_separator),
-				backend)
+			files, skip_files := ctx.should_test_dir(targ.trim_right(os.path_separator), backend)
 			ts.files << files
 			ts.skip_files << skip_files
 			continue
@@ -142,6 +141,13 @@ fn (mut ctx Context) should_test(path string, backend string) ShouldTestStatus {
 		}
 		return .skip
 	}
+	// `_test.vv2` files are v2-only integration tests. They are full V programs
+	// (with `main()`) that exercise v2-specific syntax; the test runner routes
+	// them through the v2 binary instead of v1. Honor `-run-only` so targeted
+	// runs do not pull in unrelated vv2 tests.
+	if path.ends_with('_test.vv2') {
+		return ctx.should_test_when_it_contains_matching_fns(path, backend)
+	}
 	if path.ends_with('.v') && path.count('.') == 2 {
 		if !path.all_before_last('.v').all_before_last('.').ends_with('_test') {
 			return .ignore
@@ -200,7 +206,8 @@ fn (mut ctx Context) should_test_when_it_contains_matching_fns(path string, _bac
 
 fn extract_flag_bool(flag_name string, mut after []string, flag_default bool) bool {
 	mut res := flag_default
-	orig_after := after.clone() // workaround for after.filter() codegen bug, when `mut after []string`
+	orig_after :=
+		after.clone() // workaround for after.filter() codegen bug, when `mut after []string`
 	matches_after := orig_after.filter(it != flag_name)
 	if matches_after.len < after.len {
 		after = matches_after.clone()

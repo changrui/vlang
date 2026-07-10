@@ -77,6 +77,8 @@ pub const separator = '-'.repeat(max_header_len) + '\n'
 
 pub const max_compilation_retries = get_max_compilation_retries()
 
+const c_error_bug_report_disabled_env = 'V_C_ERROR_BUG_REPORT_DISABLED'
+
 fn get_max_compilation_retries() int {
 	return os.getenv_opt('VTEST_MAX_COMPILATION_RETRIES') or { '3' }.int()
 }
@@ -143,12 +145,62 @@ pub mut:
 
 	build_environment build_constraint.Environment // see the documentation in v.build_constraint
 	custom_defines    []string                     // for adding custom defines, known only to the individual runners
+mut:
+	benchmark_mu &sync.Mutex = sync.new_mutex()
 }
 
 pub fn (mut ts TestSession) add_failed_cmd(cmd string) {
 	lock ts.failed_cmds {
 		ts.failed_cmds << cmd
 	}
+}
+
+fn (mut ts TestSession) benchmark_step() {
+	ts.benchmark_mu.lock()
+	defer {
+		ts.benchmark_mu.unlock()
+	}
+	ts.benchmark.step()
+}
+
+fn (mut ts TestSession) benchmark_step_restart() {
+	ts.benchmark_mu.lock()
+	defer {
+		ts.benchmark_mu.unlock()
+	}
+	ts.benchmark.step_restart()
+}
+
+fn (mut ts TestSession) benchmark_fail() {
+	ts.benchmark_mu.lock()
+	defer {
+		ts.benchmark_mu.unlock()
+	}
+	ts.benchmark.fail()
+}
+
+fn (mut ts TestSession) benchmark_ok() {
+	ts.benchmark_mu.lock()
+	defer {
+		ts.benchmark_mu.unlock()
+	}
+	ts.benchmark.ok()
+}
+
+fn (mut ts TestSession) benchmark_skip() {
+	ts.benchmark_mu.lock()
+	defer {
+		ts.benchmark_mu.unlock()
+	}
+	ts.benchmark.skip()
+}
+
+fn (mut ts TestSession) benchmark_stop() {
+	ts.benchmark_mu.lock()
+	defer {
+		ts.benchmark_mu.unlock()
+	}
+	ts.benchmark.stop()
 }
 
 pub fn (mut ts TestSession) show_list_of_failed_tests() {
@@ -203,10 +255,24 @@ pub fn (mut ts TestSession) print_messages() {
 		// first sent *all events* to the output reporter, so it can then process them however it wants:
 		ts.reporter.report(ts.nmessage_idx, rmessage)
 
-		if rmessage.kind in [.cmd_begin, .cmd_end, .compile_begin, .compile_end] {
+		if rmessage.kind in [.cmd_begin, .cmd_end, .compile_begin] {
 			// The following events, are sent before the test framework has determined,
 			// what the full completion status is. They can also be repeated multiple times,
 			// for tests that are flaky and need repeating.
+			continue
+		}
+		if rmessage.kind == .compile_end {
+			if rmessage.message.trim_space().len == 0 {
+				continue
+			}
+			if ts.progress_mode {
+				ts.reporter.update_last_line_and_move_to_next(ts.nmessage_idx, '')
+			}
+			if rmessage.message.ends_with('\n') {
+				eprint(rmessage.message)
+			} else {
+				eprintln(rmessage.message)
+			}
 			continue
 		}
 		if rmessage.kind == .sentinel {
@@ -215,6 +281,20 @@ pub fn (mut ts TestSession) print_messages() {
 				ts.reporter.report_stop()
 			}
 			return
+		}
+		if rmessage.kind in [.stats_output, .stats_error] {
+			mut msg := rmessage.message
+			if msg != '' && !msg.ends_with('\n') {
+				msg += '\n'
+			}
+			if rmessage.kind == .stats_error {
+				eprint(msg)
+				flush_stderr()
+			} else {
+				print(msg)
+				flush_stdout()
+			}
+			continue
 		}
 		if rmessage.kind != .info {
 			// info events can also be repeated, and should be ignored when determining
@@ -273,7 +353,10 @@ pub fn (mut ts TestSession) system(cmd string, mtc MessageThreadContext) int {
 }
 
 pub fn new_test_session(_vargs string, will_compile bool) TestSession {
+	os.setenv(c_error_bug_report_disabled_env, '1', true)
 	mut skip_files := []string{}
+	vexe := pref.vexe_path()
+	vroot := os.dir(vexe)
 	if will_compile {
 		if runner_os != 'Linux' || !github_job.starts_with('tcc-') {
 			if !os.exists('/usr/local/include/wkhtmltox/pdf.h') {
@@ -281,10 +364,11 @@ pub fn new_test_session(_vargs string, will_compile bool) TestSession {
 			}
 		}
 	}
+	if os.user_os() == 'windows' {
+		skip_files << windows_disabled_fasthttp_veb_tests(vroot)
+	}
 	skip_files = skip_files.map(os.abs_path)
 	vargs := _vargs.replace('-progress', '')
-	vexe := pref.vexe_path()
-	vroot := os.dir(vexe)
 	hash := '${sync.thread_id().hex()}_${rand.ulid()}'
 	new_vtmp_dir := setup_new_vtmp_folder(hash)
 	if term.can_show_color_on_stderr() {
@@ -312,12 +396,36 @@ pub fn new_test_session(_vargs string, will_compile bool) TestSession {
 	return ts
 }
 
+fn windows_disabled_fasthttp_veb_tests(vroot string) []string {
+	mut files := []string{}
+	for dir in [
+		os.join_path(vroot, 'vlib', 'fasthttp'),
+		os.join_path(vroot, 'vlib', 'veb'),
+	] {
+		if !os.is_dir(dir) {
+			continue
+		}
+		os.walk(dir, fn [mut files] (path string) {
+			if path.ends_with('_test.v') || path.ends_with('_test.c.v')
+				|| path.ends_with('_test.js.v') {
+				files << path
+			}
+		})
+	}
+	session_app_test := os.join_path(vroot, 'vlib', 'x', 'sessions', 'tests', 'session_app_test.v')
+	if os.exists(session_app_test) {
+		files << session_app_test
+	}
+	return files
+}
+
 fn (mut ts TestSession) handle_test_runner_option() {
 	test_runner := cmdline.option(os.args, '-test-runner', 'normal')
 	if test_runner !in pref.supported_test_runners {
 		eprintln('v test: `-test-runner ${test_runner}` is not using one of the supported test runners: ${pref.supported_test_runners_list()}')
 	}
-	test_runner_implementation_file := os.join_path(ts.vroot, 'cmd/tools/modules/testing/output_${test_runner}.v')
+	test_runner_implementation_file := os.join_path(ts.vroot,
+		'cmd/tools/modules/testing/output_${test_runner}.v')
 	if !os.exists(test_runner_implementation_file) {
 		eprintln('v test: using `-test-runner ${test_runner}` needs ${test_runner_implementation_file} to exist, and contain a valid testing.Reporter implementation for that runner. See `cmd/tools/modules/testing/output_dump.v` for an example.')
 		exit(1)
@@ -402,7 +510,7 @@ pub fn (mut ts TestSession) test() {
 	// all the testing happens here:
 	pool_of_test_runners.work_on_pointers(unsafe { remaining_files.pointers() })
 
-	ts.benchmark.stop()
+	ts.benchmark_stop()
 	ts.append_message(.sentinel, '', MessageThreadContext{ flow_id: '-1' }) // send the sentinel
 	printing_thread.wait()
 	ts.reporter.worker_threads_finish(mut ts)
@@ -438,7 +546,8 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 	tls_bench.njobs = ts.benchmark.njobs
 	abs_path := os.real_path(p.get_item[string](idx))
 	mut relative_file := abs_path
-	mut cmd_options := vflags.tokenize_to_args(ts.vargs) // make sure that `'-W -silent'` becomes `['-W', '-silent']`, while keeping quoted spaces intact
+	mut cmd_options :=
+		vflags.tokenize_to_args(ts.vargs) // make sure that `'-W -silent'` becomes `['-W', '-silent']`, while keeping quoted spaces intact
 	mut run_js := false
 
 	is_fmt := ts.vargs.contains('fmt')
@@ -523,9 +632,39 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 	if ts.show_stats {
 		skip_running = ''
 	}
-	reproduce_cmd := '${os.quoted_path(ts.vexe)} ${reproduce_options.join(' ')} ${os.quoted_path(file)}'
 	compile_options := cmd_options.filter(it != '-silent')
-	cmd := '${os.quoted_path(ts.vexe)} ${skip_running} ${compile_options.join(' ')} ${os.quoted_path(file)}'
+	mut compile_vexe := ts.vexe
+	mut compile_args := '${skip_running} ${compile_options.join(' ')}'
+	mut reproduce_vexe := ts.vexe
+	mut reproduce_args := reproduce_options.join(' ')
+	// `_test.vv2` files are v2-only integration tests: full V programs that
+	// exercise v2-specific syntax. Compile them with the v2 binary instead of
+	// v1, forwarding only flags that v2 recognizes — v2 errors on unknown
+	// flags, so v1-specific options must be stripped. Preserving `-d <name>`,
+	// `-b`/`-backend`, `-cc`, `-stats`, etc. keeps `v test -d feature ...`
+	// and per-file `// vtest vflags` working for conditional code paths.
+	is_vv2 := relative_file.ends_with('_test.vv2')
+	if is_vv2 {
+		mut v2_bin := os.join_path(ts.vroot, 'cmd', 'v2', 'v2')
+		$if windows {
+			v2_bin += '.exe'
+		}
+		if !os.is_executable(v2_bin) {
+			ts.append_message(.info, 'SKIP ${relative_file}: v2 binary not built. Run: ${os.quoted_path(ts.vexe)} -o ${os.quoted_path(v2_bin)} ${os.quoted_path(os.join_path(ts.vroot,
+				'cmd', 'v2', 'v2.v'))}', mtc)
+			ts.benchmark_skip()
+			tls_bench.skip()
+			return pool.no_result
+		}
+		compile_vexe = v2_bin
+		compile_args = filter_args_for_v2(compile_options)
+		// Reproduction command must invoke v2 too, otherwise the suggested
+		// rerun fails immediately on v2-only syntax.
+		reproduce_vexe = v2_bin
+		reproduce_args = filter_args_for_v2(reproduce_options)
+	}
+	reproduce_cmd := '${os.quoted_path(reproduce_vexe)} ${reproduce_args} ${os.quoted_path(file)}'
+	cmd := '${os.quoted_path(compile_vexe)} ${compile_args} ${os.quoted_path(file)}'
 	run_cmd := if run_js {
 		'node ${os.quoted_path(generated_binary_fpath)}'
 	} else {
@@ -544,10 +683,10 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 		}
 	}
 
-	ts.benchmark.step()
+	ts.benchmark_step()
 	tls_bench.step()
 	if produces_file_output && !ts.build_tools && (!should_be_built || abs_path in ts.skip_files) {
-		ts.benchmark.skip()
+		ts.benchmark_skip()
 		tls_bench.skip()
 		if !hide_skips {
 			ts.append_message(.skip, tls_bench.step_message_with_label_and_duration(benchmark.b_skip,
@@ -563,12 +702,11 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 		ts.append_message(.cmd_begin, cmd, mtc)
 		d_cmd := time.new_stopwatch()
 		mut res := ts.execute(cmd, mtc)
-		if res.exit_code != 0 {
-			eprintln(res.output)
-		} else {
-			println(res.output)
-		}
 		mut status := res.exit_code
+		if res.output != '' {
+			output_kind := if status == 0 { MessageKind.stats_output } else { .stats_error }
+			ts.append_message(output_kind, res.output, mtc)
+		}
 
 		cmd_duration = d_cmd.elapsed()
 		ts.append_message_with_duration(.cmd_end, '', cmd_duration, mtc)
@@ -577,13 +715,19 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 			os.setenv('VTEST_RETRY_MAX', '${details.retry}', true)
 			for retry := 1; retry <= details.retry; retry++ {
 				if !details.hide_retries {
-					ts.append_message(.info, '  [stats]        retrying ${retry}/${details.retry} of ${relative_file} ; known flaky: ${details.flaky} ...',
+					ts.append_message(.info,
+						'  [stats]        retrying ${retry}/${details.retry} of ${relative_file} ; known flaky: ${details.flaky} ...',
 						mtc)
 				}
 				os.setenv('VTEST_RETRY', '${retry}', true)
 				ts.append_message(.cmd_begin, cmd, mtc)
 				d_cmd_2 := time.new_stopwatch()
-				status = ts.system(cmd, mtc)
+				retry_res := ts.execute(cmd, mtc)
+				status = retry_res.exit_code
+				if retry_res.output != '' {
+					output_kind := if status == 0 { MessageKind.stats_output } else { .stats_error }
+					ts.append_message(output_kind, retry_res.output, mtc)
+				}
 				cmd_duration = d_cmd_2.elapsed()
 				ts.append_message_with_duration(.cmd_end, '', cmd_duration, mtc)
 
@@ -595,7 +739,8 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 				time.sleep(fail_retry_delay_ms)
 			}
 			if details.flaky && !fail_flaky {
-				ts.append_message(.info, '   *FAILURE* of the known flaky test file ${relative_file} is ignored, since VTEST_FAIL_FLAKY is 0 . Retry count: ${details.retry} .\ncmd: ${cmd}',
+				ts.append_message(.info,
+					'   *FAILURE* of the known flaky test file ${relative_file} is ignored, since VTEST_FAIL_FLAKY is 0 . Retry count: ${details.retry} .\ncmd: ${cmd}',
 					mtc)
 				unsafe {
 					goto test_passed_system
@@ -605,15 +750,14 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 			if res.output.contains(': error: ') {
 				ts.append_message(.cannot_compile, 'Cannot compile file ${file}', mtc)
 			}
-			ts.benchmark.fail()
+			ts.benchmark_fail()
 			tls_bench.fail()
 			ts.add_failed_cmd(reproduce_cmd)
 			return pool.no_result
 		}
 	} else {
 		if show_start {
-			ts.append_message(.info, '                 starting ${relative_file} ...',
-				mtc)
+			ts.append_message(.info, '                 starting ${relative_file} ...', mtc)
 		}
 		ts.append_message(.compile_begin, cmd, mtc)
 		compile_d_cmd := time.new_stopwatch()
@@ -627,10 +771,9 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 			}
 			random_sleep_ms(50, 100 * cretry)
 		}
-		ts.append_message_with_duration(.compile_end, compile_r.output, compile_cmd_duration,
-			mtc)
+		ts.append_message_with_duration(.compile_end, compile_r.output, compile_cmd_duration, mtc)
 		if compile_r.exit_code != 0 {
-			ts.benchmark.fail()
+			ts.benchmark_fail()
 			tls_bench.fail()
 			ts.append_message_with_duration(.fail, tls_bench.step_message_with_label_and_duration(benchmark.b_fail,
 				'${normalised_relative_file}\n>> compilation failed:\n${compile_r.output}',
@@ -641,7 +784,7 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 			return pool.no_result
 		}
 		tls_bench.step_restart()
-		ts.benchmark.step_restart()
+		ts.benchmark_step_restart()
 		if ts.exec_mode == .compile {
 			unsafe {
 				goto test_passed_execute
@@ -672,7 +815,8 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 			os.setenv('VTEST_RETRY_MAX', '${details.retry}', true)
 			for retry = 1; retry <= details.retry; retry++ {
 				if !details.hide_retries {
-					ts.append_message(.info, '                 retrying ${retry}/${details.retry} of ${relative_file} ; known flaky: ${details.flaky} ...',
+					ts.append_message(.info,
+						'                 retrying ${retry}/${details.retry} of ${relative_file} ; known flaky: ${details.flaky} ...',
 						mtc)
 				}
 				os.setenv('VTEST_RETRY', '${retry}', true)
@@ -699,13 +843,14 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 				for line in full_failure_output.split_into_lines() {
 					ts.append_message(.info, '>>>>>> ${line}', mtc)
 				}
-				ts.append_message(.info, '   *FAILURE* of the known flaky test file ${relative_file} is ignored, since VTEST_FAIL_FLAKY is 0 . Retry count: ${details.retry} .\n    comp_cmd: ${cmd}\n     run_cmd: ${run_cmd}',
+				ts.append_message(.info,
+					'   *FAILURE* of the known flaky test file ${relative_file} is ignored, since VTEST_FAIL_FLAKY is 0 . Retry count: ${details.retry} .\n    comp_cmd: ${cmd}\n     run_cmd: ${run_cmd}',
 					mtc)
 				unsafe {
 					goto test_passed_execute
 				}
 			}
-			ts.benchmark.fail()
+			ts.benchmark_fail()
 			tls_bench.fail()
 			cmd_duration = d_cmd.elapsed() - (fail_retry_delay_ms * details.retry)
 			ts.append_message_with_duration(.fail, tls_bench.step_message_with_label_and_duration(benchmark.b_fail,
@@ -718,7 +863,7 @@ fn worker_trunner(mut p pool.PoolProcessor, idx int, thread_id int) voidptr {
 	}
 	test_passed_system:
 	test_passed_execute:
-	ts.benchmark.ok()
+	ts.benchmark_ok()
 	tls_bench.ok()
 	if !hide_oks {
 		ts.append_message_with_duration(.ok, tls_bench.step_message_with_label_and_duration(benchmark.b_ok,
@@ -849,6 +994,39 @@ pub fn building_any_v_binaries_failed() bool {
 
 pub fn h_divider() {
 	eprintln(term.h_divider('-')#[..max_header_len])
+}
+
+// filter_args_for_v2 returns a command-line string containing only the flags
+// the v2 compiler accepts (`vlib/v2_toberemoved/pref/pref.v`). v2 errors on any unknown
+// flag, so this is used when forwarding `v test` options to v2 for
+// `_test.vv2` files. Keep these lists in sync with v2's pref validator.
+fn filter_args_for_v2(compile_options []string) string {
+	v2_value_flags := ['-backend', '-b', '-o', '-output', '-arch', '-printfn', '-gc', '-d', '-hot-fn',
+		'-cc']
+	v2_bool_flags := ['--debug', '--verbose', '-v', '--skip-genv', '--skip-builtin', '--skip-imports',
+		'--skip-type-check', '--no-parallel', '-nocache', '--nocache', '-nomarkused', '--nomarkused',
+		'-showcc', '--showcc', '-stats', '--stats', '-print-parsed-files', '--print-parsed-files',
+		'-keepc', '--profile-alloc', '-profile-alloc', '-enable-globals', '--enable-globals',
+		'-shared', '--shared', '-O0', '--single-backend', '-single-backend', '-prod', '-prealloc',
+		'-ownership']
+	tokens := vflags.tokenize_to_args(compile_options.join(' '))
+	mut out := []string{}
+	mut i := 0
+	for i < tokens.len {
+		t := tokens[i]
+		if t in v2_value_flags {
+			if i + 1 < tokens.len {
+				out << t
+				out << os.quoted_path(tokens[i + 1])
+				i += 2
+				continue
+			}
+		} else if t in v2_bool_flags {
+			out << t
+		}
+		i++
+	}
+	return out.join(' ')
 }
 
 // setup_new_vtmp_folder creates a new nested folder inside VTMP, then resets VTMP to it,

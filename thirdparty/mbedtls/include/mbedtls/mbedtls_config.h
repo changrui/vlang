@@ -4441,14 +4441,30 @@
 #undef MBEDTLS_HAVE_ASM
 #undef MBEDTLS_AESNI_C
 #undef MBEDTLS_PADLOCK_C
+/*
+ * Force 32-bit bignum limbs under tcc.
+ * On 64-bit hosts, bignum.h would otherwise typedef the double-width type as
+ * `unsigned int __attribute__((mode(TI)))` (or `__uint128_t`). tcc accepts the
+ * declaration but miscompiles the resulting 64x64->128 multiplications, which
+ * makes the modular reduction loop in ecp_modp() spin forever during the
+ * TLS 1.3 X25519 client_hello key share generation. Falling back to 32-bit
+ * limbs keeps the double-width type at uint64_t, which tcc handles correctly.
+ */
+#define MBEDTLS_HAVE_INT32
 #else // __TINYC__
 #define MBEDTLS_HAVE_ASM
 #define MBEDTLS_AESNI_C
 #define MBEDTLS_PADLOCK_C
 #endif // __TINYC__
 
-#if ( defined(__linux__) || defined(__FreeBSD__) ) || defined (__OpenBSD__)
+#if ( defined(__linux__) || defined(__FreeBSD__) ) || defined (__OpenBSD__) || defined(__APPLE__)
 #define MBEDTLS_THREADING_PTHREAD
+#define MBEDTLS_THREADING_C
+#elif defined(_WIN32)
+// Windows has no pthreads; the mutex callbacks are provided via
+// MBEDTLS_THREADING_ALT (see vlib/net/mbedtls/mbedtls_threading.h, installed by
+// mbedtls_threading_set_alt() from the net.mbedtls module init()).
+#define MBEDTLS_THREADING_ALT
 #define MBEDTLS_THREADING_C
 #else
 #undef MBEDTLS_THREADING_PTHREAD

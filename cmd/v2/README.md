@@ -1,17 +1,17 @@
 # Run all ARM64 tests
 ```
-  ./v run vlib/v2/gen/arm64/tests/run_tests.v
+  ./v run vlib/v2_toberemoved/gen/arm64/tests/run_tests.v
 
 ```
   # Run specific test with test_ssa_backends
 ```
   cd cmd/v2
-  ./test_ssa_backends arm64 ../../vlib/v2/gen/arm64/tests/string_concat.v
+  ./test_ssa_backends arm64 ../../vlib/v2_toberemoved/gen/arm64/tests/string_concat.v
 ```
 
   # Or directly with v2
 ```
-  ./v2 -backend arm64 ../../vlib/v2/gen/arm64/tests/string_concat.v
+  ./v2 -backend arm64 ../../vlib/v2_toberemoved/gen/arm64/tests/string_concat.v
 ```
 
 # Useful cleanc flags
@@ -36,13 +36,13 @@
 # Eval backend
 ```
   # Execute a small V program directly from the v2 AST:
-  ./v2 -backend eval file.v
+  ./v2 -eval file.v
 
   # Pass runtime args to the interpreted program:
-  ./v2 -backend eval file.v -- arg1 arg2
+  ./v2 -eval file.v -- arg1 arg2
 
   # Self-host under eval without recursively reusing the outer compiler flags:
-  ./v2 -backend eval cmd/v2/v2.v -- -o /tmp/v2self cmd/v2/v2.v
+  ./v2 -eval cmd/v2/v2.v -- -o /tmp/v2self cmd/v2/v2.v
 
   # Current scope: literals, locals/consts, plain fn calls, if/for/range,
   # arrays, indexing, len, println/print, and basic string interpolation.

@@ -69,6 +69,13 @@ fn test_escape_dollar_in_string() {
 	assert i == 42
 }
 
+fn test_dollar_sign_is_literal_without_braces() {
+	b := 10
+	text := 'a$b'
+	assert text == 'a$b'
+	assert b == 10
+}
+
 fn test_implicit_str() {
 	i := 42
 	assert 'int ${i}' == 'int 42'
@@ -187,6 +194,14 @@ fn test_utf8_string_interpolation() {
 	assert '>${g:-13}<' == '>Πελοπόννησος <'
 }
 
+fn test_utf8_string_interpolation_uses_grapheme_clusters() {
+	assert '>${'\u006E\u0303':10}<' == '>         ñ<'
+	assert '>${'\U0001F3F3\uFE0F\u200D\U0001F308':10}<' == '>        🏳️‍🌈<'
+	assert '>${'ห์':10}<' == '>         ห์<'
+	assert '>${'ปีเตอร์':10}<' == '>     ปีเตอร์<'
+	assert '>${'👩🏽‍💻':10}<' == '>        👩🏽‍💻<'
+}
+
 struct Sss {
 	v1 int
 	v2 f64
@@ -280,4 +295,10 @@ fn test_float_exponent_sign() {
 	assert '${a:6.1e}' == '1.2e+09'
 	assert '${a:6.2e}' == '1.23e+09'
 	assert '${a:6.5e}' == '1.23457e+09'
+}
+
+const float_literal_zero_for_interpolation = 0.0
+
+fn test_const_float_literal_string_interpolation() {
+	assert '${float_literal_zero_for_interpolation}' == '0.0'
 }

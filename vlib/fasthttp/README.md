@@ -6,10 +6,11 @@ The `fasthttp` module is a high-performance HTTP server library for V that provi
 
 - **High Performance**: Uses platform-specific I/O multiplexing:
   - `epoll` on Linux for efficient connection handling
-  - `kqueue` on macOS for high-performance event notification
+  - `kqueue` on macOS and BSD for high-performance event notification
+  - IOCP on Windows for completion-based socket I/O
 - **Non-blocking I/O**: Handles multiple concurrent connections efficiently
 - **Simple API**: Easy-to-use request handler pattern
-- **Cross-platform**: Supports Linux and macOS
+- **Cross-platform**: Supports Linux, Windows, macOS, FreeBSD, OpenBSD, NetBSD and DragonFly
 
 ## Installation
 
@@ -26,7 +27,7 @@ Here's a minimal HTTP server example:
 ```v oksyntax
 import fasthttp
 
-fn handle_request(req fasthttp.HttpRequest) ![]u8 {
+fn handle_request(req fasthttp.HttpRequest) !fasthttp.HttpResponse {
 	path := req.buffer[req.path.start..req.path.start + req.path.len].bytestr()
 
 	mut body := ''
@@ -48,7 +49,9 @@ fn handle_request(req fasthttp.HttpRequest) ![]u8 {
 	]
 	header_string := headers.join('\r\n')
 
-	return '${header_string}\r\n\r\n${body}'.bytes()
+	return fasthttp.HttpResponse{
+		content: '${header_string}\r\n\r\n${body}'.bytes()
+	}
 }
 
 fn main() {
@@ -77,7 +80,8 @@ Represents an incoming HTTP request.
 - `method: Slice` - The HTTP method (GET, POST, etc.)
 - `path: Slice` - The request path
 - `version: Slice` - The HTTP version (e.g., "HTTP/1.1")
-- `client_conn_fd: int` - Internal socket file descriptor
+- `client_conn_fd: int` - Compatibility socket descriptor/handle
+- `client_conn_handle: usize` - Pointer-sized socket handle for takeover/raw socket use
 
 ### `Slice` Struct
 
@@ -159,7 +163,7 @@ detailed server implementation with multiple routes and controllers.
 
 - **Linux**: Uses `epoll` for high-performance I/O multiplexing
 - **macOS**: Uses `kqueue` for event notification
-- **Windows**: Currently not supported
+- **Windows**: Uses IOCP for completion-based socket I/O
 
 ## Performance Considerations
 
@@ -167,6 +171,36 @@ detailed server implementation with multiple routes and controllers.
 - Handler functions should be efficient; blocking operations will affect other connections
 - Use goroutines within handlers if you need to perform long-running operations without
   blocking the I/O loop
+
+## Request-scoped allocation with `-prealloc`
+
+When an application is compiled with `-prealloc`, `fasthttp` starts a scoped
+prealloc arena for each request before decoding the HTTP request and before
+calling the request handler. All V allocations made by the request parser, the
+handler, and code called by the handler use that request arena while the handler
+is running.
+
+The arena is freed as a unit after the response no longer needs request-owned
+data. On Linux the normal response path sends the response synchronously, then
+ends the request arena. On macOS and BSD the response buffer can be kept by the
+connection until `kqueue` finishes writing it; in that case `fasthttp` detaches
+the scope from the request thread and frees it after the write completes.
+
+This means request-local V allocations are cheap bump-pointer allocations, and
+freeing them does not require walking individual objects. Startup state, server
+state, and allocations made directly by C libraries are not part of a request
+arena. If a handler starts V `spawn` work while the request scope is active, the
+generated thread wrapper retains that scope until the spawned function returns;
+void spawned functions also run inside their own scoped arena, which is freed at
+thread exit. Manual takeover responses transfer ownership to user code and
+currently abandon the request arena, so long-lived takeover handlers should
+manage their own allocation lifetime explicitly.
+
+To inspect request arena usage while developing, build with:
+
+```sh
+v -prealloc -d trace_prealloc run .
+```
 
 ## Notes
 

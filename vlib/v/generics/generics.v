@@ -3,7 +3,6 @@ module generics
 // TODO do scopes need to be cloned?
 import v.pref
 import v.ast
-import arrays
 import strings
 
 // Stage for solving generics
@@ -69,8 +68,8 @@ pub fn (mut g Generics) stmts(mut nodes []ast.Stmt) []ast.Stmt {
 			}
 		}
 	}
-	for i in arrays.reverse_iterator(solved_indexes) {
-		nodes.delete(*i)
+	for idx := solved_indexes.len; idx > 0; idx-- {
+		nodes.delete(solved_indexes[idx - 1])
 	}
 	nodes << solved_generic_fns
 	return nodes
@@ -237,7 +236,7 @@ pub fn (mut g Generics) stmt(mut node ast.Stmt) ast.Stmt {
 						g.forin_types.delete(node.val_var)
 					}
 				}
-				mut new_node := ast.ForInStmt{
+				mut for_in := ast.ForInStmt{
 					...node
 					cond:      g.expr(mut node.cond)
 					high:      g.expr(mut node.high)
@@ -247,7 +246,7 @@ pub fn (mut g Generics) stmt(mut node ast.Stmt) ast.Stmt {
 					high_type: g.unwrap_generic(node.high_type)
 					stmts:     g.stmts(mut stmts)
 				}
-				return ast.Stmt(new_node)
+				return ast.Stmt(for_in)
 			}
 			node.stmts = g.stmts(mut node.stmts)
 		}
@@ -328,6 +327,7 @@ pub fn (mut g Generics) stmt(mut node ast.Stmt) ast.Stmt {
 		}
 		ast.TypeDecl {}
 	}
+
 	return node
 }
 
@@ -434,6 +434,7 @@ fn (mut g Generics) cc_type(typ ast.Type, is_prefix_struct bool) string {
 		}
 		else {}
 	}
+
 	if is_prefix_struct && sym.language == .c {
 		styp = styp[3..]
 		if sym.kind == .struct {
@@ -520,54 +521,54 @@ pub fn (mut g Generics) generic_fn_decl(mut node ast.FnDecl) []ast.Stmt {
 		}
 		g.cur_concrete_types = concrete_types
 
-		mut new_node := ast.FnDecl{
+		mut fn_decl := ast.FnDecl{
 			...node
 		}
-		new_node = g.stmt(mut new_node) as ast.FnDecl
-		new_node = ast.FnDecl{
-			...new_node
+		fn_decl = g.stmt(mut fn_decl) as ast.FnDecl
+		fn_decl = ast.FnDecl{
+			...fn_decl
 			name:          if node.is_method {
-				g.method_concrete_name(new_node.name, concrete_types, new_node.receiver.typ)
+				g.method_concrete_name(fn_decl.name, concrete_types, fn_decl.receiver.typ)
 			} else {
-				g.concrete_name(new_node.name, concrete_types)
+				g.concrete_name(fn_decl.name, concrete_types)
 			}
 			ninstances:    0
 			generic_names: []
 		}
-		if new_node.is_method {
-			mut sym := g.table.sym(new_node.receiver.typ)
+		if fn_decl.is_method {
+			mut sym := g.table.sym(fn_decl.receiver.typ)
 			func := ast.Fn{
-				is_variadic:                    new_node.is_variadic
-				is_c_variadic:                  new_node.is_c_variadic
+				is_variadic:                    fn_decl.is_variadic
+				is_c_variadic:                  fn_decl.is_c_variadic
 				language:                       .v
-				is_pub:                         new_node.is_pub
-				is_deprecated:                  new_node.is_deprecated
-				is_noreturn:                    new_node.is_noreturn
-				is_unsafe:                      new_node.is_unsafe
-				is_must_use:                    new_node.is_must_use
-				is_keep_alive:                  new_node.is_keep_alive
-				is_method:                      new_node.is_method
-				is_static_type_method:          new_node.is_static_type_method
-				no_body:                        new_node.no_body
-				is_file_translated:             new_node.is_file_translated
-				mod:                            new_node.mod
-				file:                           new_node.file
-				file_mode:                      new_node.file_mode
-				pos:                            new_node.pos
-				return_type_pos:                new_node.return_type_pos
-				return_type:                    new_node.return_type
-				receiver_type:                  new_node.receiver.typ
-				name:                           new_node.name
-				params:                         new_node.params
+				is_pub:                         fn_decl.is_pub
+				is_deprecated:                  fn_decl.is_deprecated
+				is_noreturn:                    fn_decl.is_noreturn
+				is_unsafe:                      fn_decl.is_unsafe
+				is_must_use:                    fn_decl.is_must_use
+				is_keep_alive:                  fn_decl.is_keep_alive
+				is_method:                      fn_decl.is_method
+				is_static_type_method:          fn_decl.is_static_type_method
+				no_body:                        fn_decl.no_body
+				is_file_translated:             fn_decl.is_file_translated
+				mod:                            fn_decl.mod
+				file:                           fn_decl.file
+				file_mode:                      fn_decl.file_mode
+				pos:                            fn_decl.pos
+				return_type_pos:                fn_decl.return_type_pos
+				return_type:                    fn_decl.return_type
+				receiver_type:                  fn_decl.receiver.typ
+				name:                           fn_decl.name
+				params:                         fn_decl.params
 				generic_names:                  []
-				is_conditional:                 new_node.is_conditional
-				ctdefine_idx:                   new_node.ctdefine_idx
-				is_expand_simple_interpolation: new_node.is_expand_simple_interpolation
+				is_conditional:                 fn_decl.is_conditional
+				ctdefine_idx:                   fn_decl.ctdefine_idx
+				is_expand_simple_interpolation: fn_decl.is_expand_simple_interpolation
 			}
 			g.table.find_or_register_fn_type(func, false, true)
 			sym.register_method(func)
 		}
-		solved_fns << new_node
+		solved_fns << fn_decl
 	}
 	g.cur_concrete_types = []
 	return solved_fns
@@ -646,6 +647,7 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 			if g.cur_concrete_types.len > 0 {
 				mut args := node.args.clone()
 				mut all_concrete_types := node.concrete_types.clone()
+				mut has_ct_args := false
 				for mut ct in all_concrete_types {
 					idx := g.cur_fn.generic_names.index(g.table.type_str(ct))
 					if idx != -1 {
@@ -658,6 +660,7 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 						arg.ct_expr = false
 					}
 					arg.expr = g.expr(mut arg.expr)
+					has_ct_args = has_ct_args || arg.ct_expr
 					if mut arg.expr is ast.Ident {
 						// Solve concrete_types when the type of one argument was elem in `for elem in my_array` when my_array is T
 						forin_type := g.forin_types[arg.expr.name]
@@ -677,6 +680,8 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 					receiver_type = receiver_type.clear_flag(.generic)
 				}
 				call_name := if node.is_fn_var {
+					node.name
+				} else if has_ct_args {
 					node.name
 				} else if node.is_method {
 					g.method_concrete_name(node.name, all_concrete_types, node.receiver_type)
@@ -701,8 +706,10 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 				})
 			}
 			node.left = g.expr(mut node.left)
+			mut has_ct_args := false
 			for mut arg in node.args {
 				arg.expr = g.expr(mut arg.expr)
+				has_ct_args = has_ct_args || arg.ct_expr
 			}
 			node.or_block = g.expr(mut node.or_block) as ast.OrExpr
 			if node.is_method && g.table.sym(node.receiver_type).info is ast.Alias {
@@ -725,9 +732,17 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 			}
 			if !node.is_fn_var {
 				node.name = if node.is_method {
-					g.method_concrete_name(node.name, node.concrete_types, node.receiver_type)
+					if has_ct_args {
+						node.name
+					} else {
+						g.method_concrete_name(node.name, node.concrete_types, node.receiver_type)
+					}
 				} else {
-					g.concrete_name(node.name, node.concrete_types)
+					if has_ct_args {
+						node.name
+					} else {
+						g.concrete_name(node.name, node.concrete_types)
+					}
 				}
 			}
 			return ast.Expr(ast.CallExpr{
@@ -814,8 +829,9 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 				name := if mut node.expr is ast.Ident {
 					// var
 					if node.expr.info is ast.IdentVar && node.expr.language == .v {
-						g.styp(g.unwrap_generic(node.expr.info.typ.clear_flags(.shared_f,
-							.result))).replace('*', '')
+						ident_info := node.expr.var_info()
+						g.styp(g.unwrap_generic(ident_info.typ.clear_flags(.shared_f, .result))).replace('*',
+							'')
 					} else {
 						node.cname
 					}
@@ -860,6 +876,7 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 								})
 							}
 						}
+
 						return ast.Expr(ast.Ident{
 							...node
 							obj:     ast.Var{
@@ -945,6 +962,10 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 			node.expr = g.expr(mut node.expr)
 		}
 		ast.IndexExpr {
+			mut indices := []ast.Expr{cap: node.indices.len}
+			for mut index in node.indices {
+				indices << g.expr(mut index)
+			}
 			if g.cur_concrete_types.len > 0 {
 				return ast.Expr(ast.IndexExpr{
 					...node
@@ -952,11 +973,13 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 					typ:       g.unwrap_generic(node.typ)
 					left:      g.expr(mut node.left)
 					index:     g.expr(mut node.index)
+					indices:   indices
 					or_expr:   g.expr(mut node.or_expr) as ast.OrExpr
 				})
 			}
 			node.left = g.expr(mut node.left)
 			node.index = g.expr(mut node.index)
+			node.indices = indices
 			node.or_expr = g.expr(mut node.or_expr) as ast.OrExpr
 		}
 		ast.InfixExpr {
@@ -1183,6 +1206,17 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 				sub_struct = g.expr(mut sub_struct) as ast.SqlExpr
 			}
 		}
+		ast.SqlQueryDataExpr {
+			items := g.sql_query_data_items(node.items)
+			if g.cur_concrete_types.len > 0 {
+				return ast.Expr(ast.SqlQueryDataExpr{
+					...node
+					items: items
+					typ:   g.unwrap_generic(node.typ)
+				})
+			}
+			node.items = items
+		}
 		ast.StringInterLiteral {
 			if g.cur_concrete_types.len > 0 {
 				mut exprs := node.exprs.clone()
@@ -1268,13 +1302,41 @@ pub fn (mut g Generics) expr(mut node ast.Expr) ast.Expr {
 		}
 		else {}
 	}
+
 	return node
+}
+
+fn (mut g Generics) sql_query_data_items(items []ast.SqlQueryDataItem) []ast.SqlQueryDataItem {
+	mut new_items := []ast.SqlQueryDataItem{cap: items.len}
+	for item in items {
+		mut item_copy := item
+		new_items << g.sql_query_data_item(mut item_copy)
+	}
+	return new_items
+}
+
+fn (mut g Generics) sql_query_data_item(mut item ast.SqlQueryDataItem) ast.SqlQueryDataItem {
+	match mut item {
+		ast.SqlQueryDataLeaf {
+			item.expr = g.expr(mut item.expr)
+		}
+		ast.SqlQueryDataIf {
+			for mut branch in item.branches {
+				branch.cond = g.expr(mut branch.cond)
+				branch.items = g.sql_query_data_items(branch.items)
+			}
+		}
+	}
+
+	return item
 }
 
 fn (mut g Generics) unwrap_generic(typ ast.Type) ast.Type {
 	if typ.has_flag(.generic) {
 		if g.cur_fn != unsafe { nil } && g.cur_fn.generic_names.len > 0 {
-			if t_typ := g.table.convert_generic_type(typ, g.cur_fn.generic_names, g.cur_concrete_types) {
+			if t_typ := g.table.convert_generic_type(typ, g.cur_fn.generic_names,
+				g.cur_concrete_types)
+			{
 				return t_typ
 			}
 		}
@@ -1284,7 +1346,9 @@ fn (mut g Generics) unwrap_generic(typ ast.Type) ast.Type {
 				if sym.info is ast.Struct {
 					if sym.info.generic_types.len > 0 {
 						generic_names := sym.info.generic_types.map(g.table.sym(it).name)
-						if t_typ := g.table.convert_generic_type(typ, generic_names, g.cur_struct_init_node.generic_types.map(g.unwrap_generic(it))) {
+						if t_typ := g.table.convert_generic_type(typ, generic_names,
+							g.cur_struct_init_node.generic_types.map(g.unwrap_generic(it)))
+						{
 							return t_typ
 						}
 					}
@@ -1296,11 +1360,15 @@ fn (mut g Generics) unwrap_generic(typ ast.Type) ast.Type {
 			if sym.info is ast.Struct {
 				if sym.info.generic_types.len > 0 {
 					generic_names := sym.info.generic_types.map(g.table.sym(it).name)
-					if t_typ := g.table.convert_generic_type(typ, generic_names, sym.info.concrete_types) {
+					if t_typ := g.table.convert_generic_type(typ, generic_names,
+						sym.info.concrete_types)
+					{
 						return t_typ
 					}
 
-					if t_typ := g.table.convert_generic_type(typ, generic_names, g.cur_concrete_types) {
+					if t_typ := g.table.convert_generic_type(typ, generic_names,
+						g.cur_concrete_types)
+					{
 						return t_typ
 					}
 				}

@@ -14,11 +14,11 @@ fn main() {
 	vroot := os.dir(@VEXE)
 	v2_source := os.join_path(vroot, 'cmd', 'v2', 'v2.v')
 	v2_binary := os.join_path(vroot, 'cmd', 'v2', 'v2')
-	build_res := os.execute('${@VEXE} -gc none ${v2_source} -o ${v2_binary}')
+	build_res := os.execute('${@VEXE} -gc none -cc cc ${v2_source} -o ${v2_binary}')
 	if build_res.exit_code != 0 {
 		eprintln('Error: Failed to build v2')
 		eprintln(build_res.output)
-		return
+		exit(1)
 	}
 
 	// Determine backends from command line args.
@@ -51,7 +51,7 @@ fn main() {
 	}
 	if !os.exists(input_file) {
 		eprintln('Error: ${input_file} not found')
-		return
+		exit(1)
 	}
 
 	// Derive output binary name from input file
@@ -69,14 +69,15 @@ fn main() {
 		// Run Reference (v run test.v)
 		println('[*] Running reference: ${@VEXE} -enable-globals run ${input_file}...')
 		os.rm(ref_output_path) or {}
-		ref_cmd := '${@VEXE} -gc none -n -w -enable-globals run ${input_file} > ${ref_output_path} 2>&1'
+		ref_cc := if os.user_os() == 'macos' { '-cc cc ' } else { '' }
+		ref_cmd := '${@VEXE} -gc none ${ref_cc}-n -w -enable-globals run ${input_file} > ${ref_output_path} 2>&1'
 		ref_res := os.execute(ref_cmd)
 		ref_out := os.read_file(ref_output_path) or { '' }
 		os.rm(ref_output_path) or {}
 		if ref_res.exit_code != 0 {
 			eprintln('Error: Reference run failed')
 			eprintln(ref_out)
-			return
+			exit(1)
 		}
 		// Normalize newlines
 		expected_out = ref_out.trim_space().replace('\r\n', '\n')
@@ -89,6 +90,13 @@ fn main() {
 		// Run v2 with selected backend
 		println('[*] Running v2 -backend ${backend} ${input_file}...')
 		mut backend_flags := '-gc none -backend ${backend}'
+		if backend in ['arm64', 'x64'] {
+			if os.args.contains('-prod') {
+				backend_flags += ' -prod'
+			} else if os.args.contains('-O0') {
+				backend_flags += ' -O0'
+			}
+		}
 		if backend == 'cleanc' {
 			// cleanc needs full per-run codegen for this suite right now.
 			backend_flags += ' -nomarkused -nocache'
@@ -154,8 +162,7 @@ fn main() {
 		}
 
 		// Strip terminal control characters that script command may prepend
-		mut cleaned := gen_out.replace('\r\n', '\n').replace('\x04', '').replace('\x08',
-			'')
+		mut cleaned := gen_out.replace('\r\n', '\n').replace('\x04', '').replace('\x08', '')
 		// Remove "^D" literal string that macOS script may add
 		if cleaned.starts_with('^D') {
 			cleaned = cleaned[2..]
@@ -214,6 +221,7 @@ fn main() {
 
 	if had_failures {
 		println('\n[FAILURE] One or more backends failed')
+		exit(1)
 	} else {
 		println('\n[SUCCESS] All requested backends passed')
 	}

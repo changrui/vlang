@@ -141,22 +141,27 @@ pub fn (db DB) insert(table orm.Table, data orm.QueryData) ! {
 	mut converted_primitive_array := db.convert_query_data_to_primitives(table.name, data)!
 
 	converted_primitive_data := orm.QueryData{
-		fields: data.fields
-		data:   converted_primitive_array
-		types:  []
-		kinds:  []
-		is_and: []
+		fields:      data.fields
+		data:        converted_primitive_array
+		types:       data.types
+		parentheses: data.parentheses
+		kinds:       data.kinds
+		auto_fields: data.auto_fields
+		is_and:      data.is_and
+		batch_rows:  data.batch_rows
+		batch_key:   data.batch_key
 	}
 
-	query, converted_data := orm.orm_stmt_gen(.default, table, '`', .insert, false, '?',
-		1, converted_primitive_data, orm.QueryData{})
+	query, converted_data := orm.orm_stmt_gen(.default, table, '`', .insert, false, '?', 1,
+		converted_primitive_data, orm.QueryData{})
 	mysql_stmt_worker(db, query, converted_data, orm.QueryData{})!
 }
 
 // update is used internally by V's ORM for processing `UPDATE ` queries
 pub fn (db DB) update(table orm.Table, data orm.QueryData, where orm.QueryData) ! {
 	where_with_tenant := orm.apply_tenant_filter(table, where)
-	query, _ := orm.orm_stmt_gen(.default, table, '`', .update, false, '?', 1, data, where_with_tenant)
+	query, _ := orm.orm_stmt_gen(.default, table, '`', .update, false, '?', 1, data,
+		where_with_tenant)
 	mysql_stmt_worker(db, query, data, where_with_tenant)!
 }
 
@@ -178,8 +183,9 @@ pub fn (db DB) last_id() int {
 
 // create is used internally by V's ORM for processing table creation queries (DDL)
 pub fn (db DB) create(table orm.Table, fields []orm.TableField) ! {
-	query := orm.orm_table_gen(.mysql, table, '`', true, 0, fields, mysql_type_from_v,
-		false) or { return err }
+	query := orm.orm_table_gen(.mysql, table, '`', true, 0, fields, mysql_type_from_v, false) or {
+		return err
+	}
 	mysql_stmt_worker(db, query, orm.QueryData{}, orm.QueryData{})!
 }
 
@@ -187,6 +193,36 @@ pub fn (db DB) create(table orm.Table, fields []orm.TableField) ! {
 pub fn (db DB) drop(table orm.Table) ! {
 	query := 'DROP TABLE `${table.name}`;'
 	mysql_stmt_worker(db, query, orm.QueryData{}, orm.QueryData{})!
+}
+
+// execute runs a raw SQL query and returns result rows as driver-agnostic orm.Row values,
+// with column names populated from the result metadata.
+pub fn (db DB) execute(query string) ![]orm.Row {
+	mut guard := db.acquire_connection_guard()!
+	defer {
+		guard.release()
+	}
+	if C.mysql_query(guard.conn, query.str) != 0 {
+		throw_mysql_error_for_conn(guard.conn)!
+	}
+
+	result := C.mysql_store_result(guard.conn)
+	if result == unsafe { nil } {
+		if get_errno(guard.conn) != 0 {
+			throw_mysql_error_for_conn(guard.conn)!
+		}
+		return []orm.Row{}
+	} else {
+		res := Result{result}
+		defer { unsafe { res.free() } }
+		fields := res.fields()
+		mut names := []string{}
+		for f in fields {
+			names << f.name
+		}
+		rows := res.rows()
+		return rows.map(orm.Row{ vals: it.vals, names: names })
+	}
 }
 
 // orm_begin starts a transaction for ORM helpers.
@@ -244,6 +280,12 @@ fn mysql_stmt_bind_query_data(mut stmt Stmt, d orm.QueryData) ! {
 	}
 }
 
+fn stmt_bind_array[T](mut stmt Stmt, data []T) {
+	for element in data {
+		stmt_bind_primitive(mut stmt, orm.Primitive(element))
+	}
+}
+
 // stmt_bind_primitive binds the `data` to the `stmt`.
 fn stmt_bind_primitive(mut stmt Stmt, data orm.Primitive) {
 	match data {
@@ -294,9 +336,49 @@ fn stmt_bind_primitive(mut stmt Stmt, data orm.Primitive) {
 			stmt.bind_null()
 		}
 		[]orm.Primitive {
-			for element in data {
-				stmt_bind_primitive(mut stmt, element)
-			}
+			stmt_bind_array(mut stmt, data)
+		}
+		[]bool {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]f32 {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]f64 {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]i16 {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]i64 {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]i8 {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]int {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]string {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]time.Time {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]u16 {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]u32 {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]u64 {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]u8 {
+			stmt_bind_array(mut stmt, data)
+		}
+		[]orm.InfixType {
+			stmt_bind_array(mut stmt, data)
 		}
 	}
 }
@@ -461,16 +543,20 @@ fn mysql_type_from_v(typ int) !string {
 fn (db DB) convert_query_data_to_primitives(table string, data orm.QueryData) ![]orm.Primitive {
 	mut column_type_map := db.get_table_column_type_map(table)!
 	mut converted_data := []orm.Primitive{}
+	if data.fields.len == 0 {
+		return converted_data
+	}
 
-	for i, field in data.fields {
-		if data.data[i].type_name() == 'time.Time' {
+	for i, primitive in data.data {
+		field := data.fields[i % data.fields.len]
+		if primitive.type_name() == 'time.Time' {
 			if column_type_map[field] in ['datetime', 'timestamp'] {
-				converted_data << orm.Primitive((data.data[i] as time.Time).str())
+				converted_data << orm.Primitive((primitive as time.Time).str())
 			} else {
-				converted_data << data.data[i]
+				converted_data << primitive
 			}
 		} else {
-			converted_data << data.data[i]
+			converted_data << primitive
 		}
 	}
 

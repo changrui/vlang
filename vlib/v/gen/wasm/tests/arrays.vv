@@ -46,7 +46,7 @@ mut:
 fn test_stuff() &int {
 	a := AA{}
 
-	mut b := &int(0)
+	mut b := &int(unsafe { nil })
 	b = a.a[2]
 
 	return b
@@ -60,6 +60,13 @@ fn selector_index_assign() {
 	println(app.frame[0])
 	println(app.frame[1])
 	println(app.frame[app.idx])
+}
+
+fn fixed_array_len() {
+	a := [10, 12, 150]!
+	println(a.len)
+	b := [8]int{}
+	println(b.len)
 }
 
 fn main() {
@@ -83,4 +90,7 @@ fn main() {
 
 	println('--- selector_index_assign()')
 	selector_index_assign()
+
+	println('--- fixed_array_len()')
+	fixed_array_len()
 }

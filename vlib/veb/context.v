@@ -3,15 +3,21 @@ module veb
 import compress.gzip
 import compress.zstd
 import hash
-import json
 import net
 import net.http
 import os
 import time
+import x.json2 as json
 
 enum ContextReturnType {
 	normal
 	file
+}
+
+enum ContextTakeoverMode {
+	none
+	manual
+	reusable
 }
 
 pub enum RedirectType {
@@ -41,10 +47,14 @@ mut:
 	enable_static_compression     bool
 	static_compression_max_size   int
 	static_compression_mime_types []string
-	// if true the response should not be sent and the connection should be closed
-	// manually.
-	takeover    bool
-	return_file string
+	// controls whether veb should automatically send the response or whether the handler
+	// takes over response writing.
+	takeover_mode         ContextTakeoverMode
+	return_file           string
+	custom_mime_types_ref &map[string]string = unsafe { nil }
+	// raw client file descriptor, used by the fasthttp backend to create a TcpConn
+	// on demand when takeover_conn() is called
+	client_fd int = -1
 	// already_compressed indicates that the response body is already compressed (zstd/gzip)
 	// and the compression middlewares should skip it
 	already_compressed bool
@@ -56,7 +66,7 @@ pub:
 pub mut:
 	// how the http response should be handled by veb's backend
 	return_type       ContextReturnType = .normal
-	req               http.Request
+	req               http.Request @[skip]
 	custom_mime_types map[string]string
 	// TCP connection to client. Only for advanced usage!
 	conn &net.TcpConn = unsafe { nil }
@@ -73,14 +83,41 @@ pub mut:
 	livereload_poll_interval_ms int = 250
 }
 
-// returns the request header data from the key
-pub fn (ctx &Context) get_header(key http.CommonHeader) !string {
-	return ctx.req.header.get(key)!
+fn clone_response_writer_header(header http.Header) http.Header {
+	mut cloned := http.new_header()
+	mut seen := map[string]bool{}
+	for key in header.keys() {
+		if key in seen {
+			continue
+		}
+		seen[key] = true
+		for value in header.custom_values(key, exact: true) {
+			cloned.add_custom(key.clone(), value.clone()) or {}
+		}
+	}
+	return cloned
+}
+
+fn (mut ctx Context) preserve_for_response_writer(user_context Context) {
+	unsafe {
+		*ctx = user_context
+	}
+	ctx.res.body = user_context.res.body.clone()
+	ctx.res.header = clone_response_writer_header(user_context.res.header)
+	ctx.res.status_msg = user_context.res.status_msg.clone()
+	ctx.res.http_version = user_context.res.http_version.clone()
+	ctx.req.header = clone_response_writer_header(user_context.req.header)
+	ctx.return_file = user_context.return_file.clone()
 }
 
 // returns the request header data from the key
-pub fn (ctx &Context) get_custom_header(key string) !string {
-	return ctx.req.header.get_custom(key)!
+pub fn (ctx &Context) get_header(key http.CommonHeader) ?string {
+	return ctx.req.header.get(key)
+}
+
+// returns the request header data from the key
+pub fn (ctx &Context) get_custom_header(key string) ?string {
+	return ctx.req.header.get_custom(key)
 }
 
 // set a header on the response object
@@ -96,16 +133,21 @@ pub fn (mut ctx Context) set_custom_header(key string, value string) ! {
 // send_response_to_client finalizes the response headers and sets Content-Type to `mimetype`
 // and the response body to `response`
 pub fn (mut ctx Context) send_response_to_client(mimetype string, response string) Result {
-	if ctx.done && !ctx.takeover {
+	if ctx.done && ctx.takeover_mode == .none {
 		eprintln('[veb] a response cannot be sent twice over one connection')
 		return Result{}
 	}
 	// ctx.done is only set in this function, so in order to sent a response over the connection
 	// this value has to be set to true. Assuming the user doesn't use `ctx.conn` directly.
 	ctx.done = true
+	if ctx.res.body.len > 0 {
+		unsafe { ctx.res.body.free() }
+		ctx.res.body = ''
+	}
 	$if veb_livereload ? {
 		if mimetype == 'text/html' {
-			ctx.res.body = response.replace('</html>', '<script src="/veb_livereload/${veb_livereload_server_start}/script.js"></script>\n</html>')
+			ctx.res.body = response.replace('</html>',
+				'<script src="/veb_livereload/${veb_livereload_server_start}/script.js"></script>\n</html>')
 		} else {
 			ctx.res.body = response.clone()
 		}
@@ -125,7 +167,7 @@ pub fn (mut ctx Context) send_response_to_client(mimetype string, response strin
 	}
 	// send veb's closing headers
 	ctx.res.header.set(.server, 'veb')
-	if !ctx.takeover && ctx.client_wants_to_close {
+	if ctx.takeover_mode == .none && ctx.client_wants_to_close {
 		// Only sent the `Connection: close` header when the client wants to close
 		// the connection. This typically happens when the client only supports HTTP 1.0
 		ctx.res.header.set(.connection, 'close')
@@ -135,8 +177,10 @@ pub fn (mut ctx Context) send_response_to_client(mimetype string, response strin
 	if ctx.res.status_code == 0 {
 		ctx.res.set_status(.ok)
 	}
-	if ctx.takeover {
+	if ctx.takeover_mode != .none && ctx.conn != unsafe { nil } {
 		fast_send_resp(mut ctx.conn, ctx.res) or {}
+		unsafe { ctx.res.body.free() }
+		ctx.res.body = ''
 	}
 	// result is send in `veb.v`, `handle_route`
 	return Result{}
@@ -168,11 +212,22 @@ pub fn (mut ctx Context) json[T](j T) Result {
 
 // Response with a pretty-printed JSON result
 pub fn (mut ctx Context) json_pretty[T](j T) Result {
-	json_s := json.encode_pretty(j)
+	json_s := json.encode(j, prettify: true)
 	return ctx.send_response_to_client('application/json', json_s)
 }
 
 // Response HTTP_OK with file as payload
+fn (ctx &Context) custom_mime_type(ext string) ?string {
+	if ct := ctx.custom_mime_types[ext] {
+		return ct
+	}
+	if unsafe { ctx.custom_mime_types_ref != nil } {
+		custom_mime_types := unsafe { *ctx.custom_mime_types_ref }
+		return custom_mime_types[ext]
+	}
+	return none
+}
+
 pub fn (mut ctx Context) file(file_path string) Result {
 	if !os.exists(file_path) {
 		eprintln('[veb] file "${file_path}" does not exist')
@@ -181,7 +236,7 @@ pub fn (mut ctx Context) file(file_path string) Result {
 	ext := os.file_ext(file_path)
 	mut content_type := ctx.content_type
 	if content_type.len == 0 {
-		if ct := ctx.custom_mime_types[ext] {
+		if ct := ctx.custom_mime_type(ext) {
 			content_type = ct
 		} else {
 			content_type = mime_types[ext]
@@ -244,16 +299,12 @@ fn (mut ctx Context) send_file(content_type string, file_path string) Result {
 			}
 			// Try zstd first if enabled, then gzip
 			if use_zstd {
-				if result := ctx.serve_compressed_static(content_type, file_path, data,
-					.zstd)
-				{
+				if result := ctx.serve_compressed_static(content_type, file_path, data, .zstd) {
 					return result
 				}
 			}
 			if use_gzip {
-				if result := ctx.serve_compressed_static(content_type, file_path, data,
-					.gzip)
-				{
+				if result := ctx.serve_compressed_static(content_type, file_path, data, .gzip) {
 					return result
 				}
 			}
@@ -265,7 +316,7 @@ fn (mut ctx Context) send_file(content_type string, file_path string) Result {
 		}
 	}
 	// Takeover mode: load file in memory (backward compatibility)
-	if ctx.takeover {
+	if ctx.takeover_mode != .none {
 		data := os.read_file(file_path) or {
 			eprintln('[veb] error while trying to read file: ${err.msg()}')
 			return ctx.server_error('could not read resource')
@@ -352,8 +403,7 @@ fn (mut ctx Context) serve_precompressed_file(content_type string, file_path str
 	}
 	// Then try veb-managed cache files under os.cache_dir().
 	cached_path := static_compression_cache_path(file_path, ext)
-	return ctx.serve_compressed_path_if_fresh(content_type, cached_path, encoding_name,
-		orig_mtime)
+	return ctx.serve_compressed_path_if_fresh(content_type, cached_path, encoding_name, orig_mtime)
 }
 
 // serve_compressed_static compresses data and serves it, optionally caching to disk.
@@ -369,6 +419,7 @@ fn (mut ctx Context) serve_compressed_static(content_type string, file_path stri
 			c, '.gz', 'gzip'
 		}
 	}
+
 	compressed_path := static_compression_cache_path(file_path, ext)
 	// Try to save compressed version for future requests
 	mut write_success := true
@@ -491,12 +542,69 @@ pub fn (mut ctx Context) set_content_type(mime string) {
 // This function is useful when you want to keep the connection alive and/or
 // send multiple responses. Like with the SSE.
 pub fn (mut ctx Context) takeover_conn() {
-	ctx.takeover = true
+	ctx.takeover_mode = .manual
+	ctx.prepare_takeover_conn()
+}
+
+fn (mut ctx Context) prepare_takeover_conn() {
+	if ctx.conn == unsafe { nil } && ctx.client_fd >= 0 {
+		// For the fasthttp backend: create a TcpConn from the raw fd on demand.
+		// Set the fd to blocking mode. fasthttp uses non-blocking sockets,
+		// but TcpConn.write() expects blocking behavior for reliable writes.
+		$if !windows {
+			flags := C.fcntl(ctx.client_fd, C.F_GETFL, 0)
+			if flags != -1 {
+				C.fcntl(ctx.client_fd, C.F_SETFL, flags & ~C.O_NONBLOCK)
+			}
+		}
+		ctx.conn = &net.TcpConn{
+			sock:          net.TcpSocket{
+				Socket: net.Socket{
+					handle: ctx.client_fd
+				}
+			}
+			handle:        ctx.client_fd
+			is_blocking:   true
+			read_timeout:  30 * time.second
+			write_timeout: 30 * time.second
+		}
+	} else if ctx.conn != unsafe { nil } {
+		// The connection exists but uses non-blocking I/O.
+		// Switch to blocking mode for reliable SSE writes.
+		fd := ctx.conn.handle
+		$if !windows {
+			flags := C.fcntl(fd, C.F_GETFL, 0)
+			if flags != -1 {
+				C.fcntl(fd, C.F_SETFL, flags & ~C.O_NONBLOCK)
+			}
+		}
+		ctx.conn.is_blocking = true
+		ctx.conn.set_read_timeout(30 * time.second)
+		ctx.conn.set_write_timeout(30 * time.second)
+	}
+}
+
+// takeover_conn_reusable prevents veb from automatically sending a response,
+// but lets veb keep the connection in the read loop after the handler returns.
+// The handler must write exactly one complete HTTP response with a clear body
+// boundary, such as Content-Length or a final chunk for Transfer-Encoding:
+// chunked. If the client asked to close the connection, veb will still close it.
+pub fn (mut ctx Context) takeover_conn_reusable() {
+	ctx.takeover_mode = .reusable
+	ctx.prepare_takeover_conn()
 }
 
 // user_agent returns the user-agent header for the current client
 pub fn (ctx &Context) user_agent() string {
 	return ctx.req.header.get(.user_agent) or { '' }
+}
+
+fn peer_ip_from_socket_handle(handle int) string {
+	address := net.peer_addr_from_socket_handle(handle) or { return '' }.str()
+	if address.contains(']:') {
+		return address.all_before(']:').all_after('[')
+	}
+	return address.all_before(':')
 }
 
 // Returns the ip address from the current user
@@ -514,8 +622,11 @@ pub fn (ctx &Context) ip() string {
 	if ip.contains(',') {
 		ip = ip.all_before(',')
 	}
-	if ip == '' {
+	if ip == '' && ctx.conn != unsafe { nil } {
 		ip = ctx.conn.peer_ip() or { '' }
+	}
+	if ip == '' && ctx.client_fd >= 0 {
+		ip = peer_ip_from_socket_handle(ctx.client_fd)
 	}
 	return ip
 }

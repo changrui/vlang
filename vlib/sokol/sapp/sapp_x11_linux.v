@@ -555,8 +555,8 @@ fn x11_init_extensions() {
 		g_sapp_state.x11.xdnd.text_uri_list = C.XInternAtom(d, c'text/uri-list', x_false)
 	}
 	// Check Xi extension for raw mouse input
-	if C.XQueryExtension(d, c'XInputExtension', &g_sapp_state.x11.xi.major_opcode, &g_sapp_state.x11.xi.event_base,
-		&g_sapp_state.x11.xi.error_base) != 0 {
+	if C.XQueryExtension(d, c'XInputExtension', &g_sapp_state.x11.xi.major_opcode,
+		&g_sapp_state.x11.xi.event_base, &g_sapp_state.x11.xi.error_base) != 0 {
 		g_sapp_state.x11.xi.major = 2
 		g_sapp_state.x11.xi.minor = 0
 		if C.XIQueryVersion(d, &g_sapp_state.x11.xi.major, &g_sapp_state.x11.xi.minor) == 0 {
@@ -713,6 +713,22 @@ fn x11_translate_keysyms(keysyms &KeySym, width int) KeyCode {
 	}
 }
 
+fn x11_lookup_keysym(event &C.XEvent) KeySym {
+	mut keysym := KeySym(0)
+	unsafe {
+		C.XLookupString(&event.xkey, nil, 0, &keysym, nil)
+	}
+	return keysym
+}
+
+fn x11_translate_event_key(scancode int, keysym KeySym) KeyCode {
+	key := linux_translate_navigation_or_keypad_keysym(u32(keysym))
+	if key != .invalid {
+		return key
+	}
+	return x11_translate_key(scancode)
+}
+
 // XKB key name to keycode mapping entry
 struct X11KeymapEntry {
 mut:
@@ -741,8 +757,7 @@ fn x11_init_keytable() {
 	if desc == unsafe { nil } {
 		return
 	}
-	C.XkbGetNames(g_sapp_state.x11.display, xkb_key_names_mask | xkb_key_aliases_mask,
-		desc)
+	C.XkbGetNames(g_sapp_state.x11.display, xkb_key_names_mask | xkb_key_aliases_mask, desc)
 
 	scancode_min := int(desc.min_key_code)
 	scancode_max := int(desc.max_key_code)
@@ -887,8 +902,8 @@ fn x11_init_keytable() {
 		if key == .invalid && desc.names.key_aliases != unsafe { nil } {
 			for i in 0 .. int(desc.names.num_key_aliases) {
 				if unsafe {
-					C.strncmp(&char(&desc.names.key_aliases[i].real[0]), &char(&desc.names.keys[scancode].name[0]),
-						usize(xkb_key_name_length))
+					C.strncmp(&char(&desc.names.key_aliases[i].real[0]),
+						&char(&desc.names.keys[scancode].name[0]), usize(xkb_key_name_length))
 				} != 0 {
 					continue
 				}
@@ -912,14 +927,14 @@ fn x11_init_keytable() {
 	C.XkbFreeKeyboard(desc, 0, x_true)
 
 	// Fall back using traditional keysym lookup
-	mut width := 0
-	keysyms := C.XGetKeyboardMapping(g_sapp_state.x11.display, u8(scancode_min),
-		scancode_max - scancode_min + 1, &width)
+	mut syms_per_code := 0
+	keysyms := C.XGetKeyboardMapping(g_sapp_state.x11.display, u8(scancode_min), scancode_max -
+		scancode_min + 1, &syms_per_code)
 	for scancode in scancode_min .. scancode_max + 1 {
 		if g_sapp_state.keycodes[scancode] == .invalid {
-			base := usize((scancode - scancode_min) * width)
+			base := usize((scancode - scancode_min) * syms_per_code)
 			g_sapp_state.keycodes[scancode] = x11_translate_keysyms(unsafe { keysyms + base },
-				width)
+				syms_per_code)
 		}
 	}
 	C.XFree(keysyms)
@@ -952,22 +967,24 @@ fn x11_query_system_dpi() {
 // === Keysym to unicode ===
 
 fn x11_keysym_to_unicode(keysym KeySym) i32 {
+	keysym_value := u64(keysym)
 	// Latin-1 characters (1:1 mapping)
-	if (keysym >= 0x0020 && keysym <= 0x007e) || (keysym >= 0x00a0 && keysym <= 0x00ff) {
-		return i32(keysym)
+	if (keysym_value >= 0x0020 && keysym_value <= 0x007e)
+		|| (keysym_value >= 0x00a0 && keysym_value <= 0x00ff) {
+		return i32(keysym_value)
 	}
 	// Directly encoded 24-bit UCS characters
-	if (keysym & 0xff000000) == 0x01000000 {
-		return i32(keysym & 0x00ffffff)
+	if (keysym_value & 0xff000000) == 0x01000000 {
+		return i32(keysym_value & 0x00ffffff)
 	}
 	// Binary search in table
 	mut min := 0
 	mut max := x11_keysymtab.len - 1
 	for max >= min {
 		mid := (min + max) / 2
-		if u64(x11_keysymtab[mid].keysym) < keysym {
+		if u64(x11_keysymtab[mid].keysym) < keysym_value {
 			min = mid + 1
-		} else if u64(x11_keysymtab[mid].keysym) > keysym {
+		} else if u64(x11_keysymtab[mid].keysym) > keysym_value {
 			max = mid - 1
 		} else {
 			return i32(x11_keysymtab[mid].ucs)
@@ -991,15 +1008,15 @@ fn x11_send_event(msg_type Atom, a i64, b i64, c_ i64, d i64, e i64) {
 		event.xclient.data.l[3] = d
 		event.xclient.data.l[4] = e
 	}
-	C.XSendEvent(g_sapp_state.x11.display, g_sapp_state.x11.root, x_false, substructure_notify_mask | substructure_redirect_mask,
-		&event)
+	C.XSendEvent(g_sapp_state.x11.display, g_sapp_state.x11.root, x_false,
+		substructure_notify_mask | substructure_redirect_mask, &event)
 }
 
 fn x11_wait_for_event(event_type int, timeout_sec f64, out_event &C.XEvent) bool {
 	// Simple polling loop
 	for {
-		if C.XCheckTypedWindowEvent(g_sapp_state.x11.display, g_sapp_state.x11.window,
-			event_type, out_event) != 0 {
+		if C.XCheckTypedWindowEvent(g_sapp_state.x11.display, g_sapp_state.x11.window, event_type,
+			out_event) != 0 {
 			return true
 		}
 		mut fd := C.pollfd{
@@ -1035,8 +1052,10 @@ fn x11_update_dimensions(x11_window_width int, x11_window_height int) {
 	g_sapp_state.window_height = x11_roundf_gzero(f32(x11_window_height) / window_scale)
 	cur_fb_width := g_sapp_state.framebuffer_width
 	cur_fb_height := g_sapp_state.framebuffer_height
-	g_sapp_state.framebuffer_width = x11_roundf_gzero(f32(g_sapp_state.window_width) * g_sapp_state.dpi_scale)
-	g_sapp_state.framebuffer_height = x11_roundf_gzero(f32(g_sapp_state.window_height) * g_sapp_state.dpi_scale)
+	g_sapp_state.framebuffer_width =
+		x11_roundf_gzero(f32(g_sapp_state.window_width) * g_sapp_state.dpi_scale)
+	g_sapp_state.framebuffer_height =
+		x11_roundf_gzero(f32(g_sapp_state.window_height) * g_sapp_state.dpi_scale)
 	dim_changed := g_sapp_state.framebuffer_width != cur_fb_width
 		|| g_sapp_state.framebuffer_height != cur_fb_height
 	if dim_changed && !g_sapp_state.first_frame {
@@ -1060,6 +1079,39 @@ fn x11_set_fullscreen(enable bool) {
 			 i64(g_sapp_state.x11.net_wm_state_fullscreen), 0, 1, 0)
 		}
 	}
+	C.XFlush(g_sapp_state.x11.display)
+}
+
+// set_resizable toggles whether the current Linux window can be resized by the window manager.
+pub fn set_resizable(resizable bool) {
+	$if sokol_wayland ? {
+		wl_set_resizable(resizable)
+	} $else {
+		x11_set_resizable(resizable)
+	}
+}
+
+fn x11_set_resizable(resizable bool) {
+	if g_sapp_state.x11.display == unsafe { nil } || g_sapp_state.x11.window == x_window_none {
+		return
+	}
+	mut hints := C.XAllocSizeHints()
+	if hints == unsafe { nil } {
+		return
+	}
+	hints.flags = pw_gravity
+	hints.win_gravity = center_gravity
+	if !resizable {
+		mut attribs := C.XWindowAttributes{}
+		C.XGetWindowAttributes(g_sapp_state.x11.display, g_sapp_state.x11.window, &attribs)
+		hints.flags |= i64(1 << 4) | i64(1 << 5) // PMinSize | PMaxSize
+		hints.min_width = attribs.width
+		hints.min_height = attribs.height
+		hints.max_width = attribs.width
+		hints.max_height = attribs.height
+	}
+	C.XSetWMNormalHints(g_sapp_state.x11.display, g_sapp_state.x11.window, hints)
+	C.XFree(hints)
 	C.XFlush(g_sapp_state.x11.display)
 }
 
@@ -1091,18 +1143,16 @@ fn x11_create_window(visual_ &C.Visual, depth int) {
 	// wamask = CWBorderPixel | CWColormap | CWEventMask
 	wamask := u64(0x800 | 0x2000 | 0x800)
 	x11_grab_error_handler()
-	g_sapp_state.x11.window = C.XCreateWindow(g_sapp_state.x11.display, g_sapp_state.x11.root,
-		0, 0, u32(x11_window_width), u32(x11_window_height), 0, dep, input_output, vis,
-		wamask, &wa)
+	g_sapp_state.x11.window = C.XCreateWindow(g_sapp_state.x11.display, g_sapp_state.x11.root, 0,
+		0, u32(x11_window_width), u32(x11_window_height), 0, dep, input_output, vis, wamask, &wa)
 	x11_release_error_handler()
-	if g_sapp_state.x11.window == 0 {
+	if g_sapp_state.x11.window == x_window_none {
 		eprintln('sokol_app: X11: failed to create window')
 		return
 	}
 	mut protocols := [1]Atom{}
 	protocols[0] = g_sapp_state.x11.wm_delete_window
-	C.XSetWMProtocols(g_sapp_state.x11.display, g_sapp_state.x11.window, &protocols[0],
-		1)
+	C.XSetWMProtocols(g_sapp_state.x11.display, g_sapp_state.x11.window, &protocols[0], 1)
 	mut hints := C.XAllocSizeHints()
 	hints.flags = pw_gravity
 	hints.win_gravity = center_gravity
@@ -1111,22 +1161,23 @@ fn x11_create_window(visual_ &C.Visual, depth int) {
 	// Announce support for drag'n'drop
 	if g_sapp_state.drop.enabled {
 		version := Atom(x11_xdnd_version)
-		C.XChangeProperty(g_sapp_state.x11.display, g_sapp_state.x11.window, g_sapp_state.x11.xdnd.xdnd_aware,
-			xa_atom, 32, prop_mode_replace, unsafe { &u8(&version) }, 1)
+		C.XChangeProperty(g_sapp_state.x11.display, g_sapp_state.x11.window,
+			g_sapp_state.x11.xdnd.xdnd_aware, xa_atom, 32, prop_mode_replace,
+			unsafe { &u8(&version) }, 1)
 	}
 	x11_update_window_title()
 	x11_update_dimensions_from_window_size()
 }
 
 fn x11_destroy_window() {
-	if g_sapp_state.x11.window != 0 {
+	if g_sapp_state.x11.window != x_window_none {
 		C.XUnmapWindow(g_sapp_state.x11.display, g_sapp_state.x11.window)
 		C.XDestroyWindow(g_sapp_state.x11.display, g_sapp_state.x11.window)
-		g_sapp_state.x11.window = 0
+		g_sapp_state.x11.window = x_window_none
 	}
-	if g_sapp_state.x11.colormap != 0 {
+	if g_sapp_state.x11.colormap != x_colormap_none {
 		C.XFreeColormap(g_sapp_state.x11.display, g_sapp_state.x11.colormap)
-		g_sapp_state.x11.colormap = 0
+		g_sapp_state.x11.colormap = x_colormap_none
 	}
 	C.XFlush(g_sapp_state.x11.display)
 }
@@ -1151,12 +1202,12 @@ fn x11_update_window_title() {
 	title := &char(&g_sapp_state.window_title[0])
 	C.Xutf8SetWMProperties(g_sapp_state.x11.display, g_sapp_state.x11.window, title, title,
 		unsafe { nil }, 0, unsafe { nil }, unsafe { nil }, unsafe { nil })
-	C.XChangeProperty(g_sapp_state.x11.display, g_sapp_state.x11.window, g_sapp_state.x11.net_wm_name,
-		g_sapp_state.x11.utf8_string, 8, prop_mode_replace, &g_sapp_state.window_title[0],
-		int(C.strlen(title)))
-	C.XChangeProperty(g_sapp_state.x11.display, g_sapp_state.x11.window, g_sapp_state.x11.net_wm_icon_name,
-		g_sapp_state.x11.utf8_string, 8, prop_mode_replace, &g_sapp_state.window_title[0],
-		int(C.strlen(title)))
+	C.XChangeProperty(g_sapp_state.x11.display, g_sapp_state.x11.window,
+		g_sapp_state.x11.net_wm_name, g_sapp_state.x11.utf8_string, 8, prop_mode_replace,
+		&g_sapp_state.window_title[0], int(C.strlen(title)))
+	C.XChangeProperty(g_sapp_state.x11.display, g_sapp_state.x11.window,
+		g_sapp_state.x11.net_wm_icon_name, g_sapp_state.x11.utf8_string, 8, prop_mode_replace,
+		&g_sapp_state.window_title[0], int(C.strlen(title)))
 	C.XFlush(g_sapp_state.x11.display)
 }
 
@@ -1170,8 +1221,7 @@ fn x11_create_hidden_cursor() {
 	img.xhot = 0
 	img.yhot = 0
 	unsafe { C.memset(img.pixels, 0, usize(16 * 16 * 4)) }
-	g_sapp_state.x11.hidden_cursor = C.XcursorImageLoadCursor(g_sapp_state.x11.display,
-		img)
+	g_sapp_state.x11.hidden_cursor = C.XcursorImageLoadCursor(g_sapp_state.x11.display, img)
 	C.XcursorImageDestroy(img)
 }
 
@@ -1180,12 +1230,12 @@ fn x11_create_standard_cursor(cursor MouseCursor, name &char, theme &char, size 
 	if theme != unsafe { nil } {
 		img := C.XcursorLibraryLoadImage(name, theme, size)
 		if img != unsafe { nil } {
-			g_sapp_state.x11.standard_cursors[idx] = C.XcursorImageLoadCursor(g_sapp_state.x11.display,
-				img)
+			g_sapp_state.x11.standard_cursors[idx] =
+				C.XcursorImageLoadCursor(g_sapp_state.x11.display, img)
 			C.XcursorImageDestroy(img)
 		}
 	}
-	if g_sapp_state.x11.standard_cursors[idx] == 0 && fallback_native != 0 {
+	if g_sapp_state.x11.standard_cursors[idx] == x_cursor_none && fallback_native != 0 {
 		g_sapp_state.x11.standard_cursors[idx] = C.XCreateFontCursor(g_sapp_state.x11.display,
 			fallback_native)
 	}
@@ -1208,14 +1258,14 @@ fn x11_create_standard_cursors() {
 }
 
 fn x11_destroy_standard_cursors() {
-	if g_sapp_state.x11.hidden_cursor != 0 {
+	if g_sapp_state.x11.hidden_cursor != x_cursor_none {
 		C.XFreeCursor(g_sapp_state.x11.display, g_sapp_state.x11.hidden_cursor)
-		g_sapp_state.x11.hidden_cursor = 0
+		g_sapp_state.x11.hidden_cursor = x_cursor_none
 	}
 	for i in 0 .. mousecursor_num {
-		if g_sapp_state.x11.standard_cursors[i] != 0 {
+		if g_sapp_state.x11.standard_cursors[i] != x_cursor_none {
 			C.XFreeCursor(g_sapp_state.x11.display, g_sapp_state.x11.standard_cursors[i])
-			g_sapp_state.x11.standard_cursors[i] = 0
+			g_sapp_state.x11.standard_cursors[i] = x_cursor_none
 		}
 	}
 }
@@ -1231,16 +1281,18 @@ fn x11_update_cursor(cursor MouseCursor, shown bool) {
 	if shown {
 		if g_sapp_state.custom_cursor_bound[idx] {
 			xcursor := g_sapp_state.x11.custom_cursors[idx]
-			if xcursor != 0 {
+			if xcursor != x_cursor_none {
 				C.XDefineCursor(g_sapp_state.x11.display, g_sapp_state.x11.window, xcursor)
 			}
-		} else if g_sapp_state.x11.standard_cursors[idx] != 0 {
-			C.XDefineCursor(g_sapp_state.x11.display, g_sapp_state.x11.window, g_sapp_state.x11.standard_cursors[idx])
+		} else if g_sapp_state.x11.standard_cursors[idx] != x_cursor_none {
+			C.XDefineCursor(g_sapp_state.x11.display, g_sapp_state.x11.window,
+				g_sapp_state.x11.standard_cursors[idx])
 		} else {
 			C.XUndefineCursor(g_sapp_state.x11.display, g_sapp_state.x11.window)
 		}
 	} else {
-		C.XDefineCursor(g_sapp_state.x11.display, g_sapp_state.x11.window, g_sapp_state.x11.hidden_cursor)
+		C.XDefineCursor(g_sapp_state.x11.display, g_sapp_state.x11.window,
+			g_sapp_state.x11.hidden_cursor)
 	}
 	C.XFlush(g_sapp_state.x11.display)
 }
@@ -1264,9 +1316,9 @@ fn x11_lock_mouse(do_lock bool) {
 			xi_set_mask(unsafe { &mask[0] }, xi_raw_motion)
 			C.XISelectEvents(g_sapp_state.x11.display, g_sapp_state.x11.root, &em, 1)
 		}
-		C.XGrabPointer(g_sapp_state.x11.display, g_sapp_state.x11.window, x_true, u32(button_press_mask | button_release_mask | pointer_motion_mask),
-			grab_mode_async, grab_mode_async, g_sapp_state.x11.window, g_sapp_state.x11.hidden_cursor,
-			current_time)
+		C.XGrabPointer(g_sapp_state.x11.display, g_sapp_state.x11.window, x_true,
+			u32(button_press_mask | button_release_mask | pointer_motion_mask), grab_mode_async,
+			grab_mode_async, g_sapp_state.x11.window, g_sapp_state.x11.hidden_cursor, current_time)
 	} else {
 		if g_sapp_state.x11.xi.available {
 			mut em := C.XIEventMask{}
@@ -1276,8 +1328,8 @@ fn x11_lock_mouse(do_lock bool) {
 			em.mask = unsafe { &mask[0] }
 			C.XISelectEvents(g_sapp_state.x11.display, g_sapp_state.x11.root, &em, 1)
 		}
-		C.XWarpPointer(g_sapp_state.x11.display, Window(0), g_sapp_state.x11.window, 0,
-			0, 0, 0, int(g_sapp_state.mouse.x), int(g_sapp_state.mouse.y))
+		C.XWarpPointer(g_sapp_state.x11.display, Window(0), g_sapp_state.x11.window, 0, 0, 0, 0,
+			int(g_sapp_state.mouse.x), int(g_sapp_state.mouse.y))
 		C.XUngrabPointer(g_sapp_state.x11.display, current_time)
 	}
 	C.XFlush(g_sapp_state.x11.display)
@@ -1289,8 +1341,8 @@ fn x11_set_clipboard_string(_str &char) {
 	if !g_sapp_state.clipboard.enabled || g_sapp_state.clipboard.buffer == unsafe { nil } {
 		return
 	}
-	C.XSetSelectionOwner(g_sapp_state.x11.display, g_sapp_state.x11.clipboard_atom, g_sapp_state.x11.window,
-		current_time)
+	C.XSetSelectionOwner(g_sapp_state.x11.display, g_sapp_state.x11.clipboard_atom,
+		g_sapp_state.x11.window, current_time)
 }
 
 fn x11_get_clipboard_string() &char {
@@ -1302,8 +1354,8 @@ fn x11_get_clipboard_string() &char {
 		return g_sapp_state.clipboard.buffer
 	}
 	sapp_selection := C.XInternAtom(g_sapp_state.x11.display, c'SAPP_SELECTION', x_false)
-	C.XConvertSelection(g_sapp_state.x11.display, g_sapp_state.x11.clipboard_atom, g_sapp_state.x11.utf8_string,
-		sapp_selection, g_sapp_state.x11.window, current_time)
+	C.XConvertSelection(g_sapp_state.x11.display, g_sapp_state.x11.clipboard_atom,
+		g_sapp_state.x11.utf8_string, sapp_selection, g_sapp_state.x11.window, current_time)
 	mut event := C.XEvent{}
 	if !x11_wait_for_event(x_selection_notify, 0.1, &event) {
 		return unsafe { nil }
@@ -1315,20 +1367,21 @@ fn x11_get_clipboard_string() &char {
 		mut data := &u8(nil)
 		mut actual_type := Atom(0)
 		mut actual_format := 0
-		mut item_count := u64(0)
-		mut bytes_after := u64(0)
-		C.XGetWindowProperty(g_sapp_state.x11.display, event.xselection.requestor, event.xselection.property,
-			0, 0x7fffffff, x_true, g_sapp_state.x11.utf8_string, &actual_type, &actual_format,
-			&item_count, &bytes_after, &&u8(&data))
+		mut item_count := XlibULong(0)
+		mut bytes_after := XlibULong(0)
+		C.XGetWindowProperty(g_sapp_state.x11.display, event.xselection.requestor,
+			event.xselection.property, 0, 0x7fffffff, x_true, g_sapp_state.x11.utf8_string,
+			&actual_type, &actual_format, &item_count, &bytes_after, &&u8(&data))
 		if data == nil {
 			return nil
 		}
-		if item_count >= usize(g_sapp_state.clipboard.buf_size) {
+		item_size := usize(item_count)
+		if item_size >= usize(g_sapp_state.clipboard.buf_size) {
 			C.XFree(data)
 			return nil
 		}
-		C.memcpy(g_sapp_state.clipboard.buffer, data, usize(item_count))
-		g_sapp_state.clipboard.buffer[item_count] = 0
+		C.memcpy(g_sapp_state.clipboard.buffer, data, item_size)
+		g_sapp_state.clipboard.buffer[item_size] = 0
 		C.XFree(data)
 		return g_sapp_state.clipboard.buffer
 	}
@@ -1479,21 +1532,21 @@ fn x11_keyrelease_repeat(keycode int) {
 
 // === Window property helpers ===
 
-fn x11_get_window_property(window Window, property Atom, req_type Atom, value &&u8) u64 {
+fn x11_get_window_property(window Window, property Atom, req_type Atom, value &&u8) usize {
 	mut actual_type := Atom(0)
 	mut actual_format := 0
-	mut item_count := u64(0)
-	mut bytes_after := u64(0)
+	mut item_count := XlibULong(0)
+	mut bytes_after := XlibULong(0)
 	C.XGetWindowProperty(g_sapp_state.x11.display, window, property, 0, 0x7fffffff, x_false,
-		req_type, &actual_type, &actual_format, &item_count, &bytes_after, unsafe { &&&u8(value) })
-	return item_count
+		req_type, &actual_type, &actual_format, &item_count, &bytes_after, value)
+	return usize(item_count)
 }
 
 fn x11_get_window_state() int {
 	mut result := withdrawn_state
 	mut state := &u8(unsafe { nil })
-	if x11_get_window_property(g_sapp_state.x11.window, g_sapp_state.x11.wm_state, g_sapp_state.x11.wm_state,
-		&&u8(&state)) >= 2 {
+	if x11_get_window_property(g_sapp_state.x11.window, g_sapp_state.x11.wm_state,
+		g_sapp_state.x11.wm_state, &&u8(&state)) >= 2 {
 		unsafe {
 			result = int(*(&u32(state)))
 		}
@@ -1560,7 +1613,7 @@ fn x11_parse_dropped_files_list(src &char) bool {
 					digits[1] = u8(*(p + 1))
 					digits[2] = 0
 					p = &char(usize(p) + 2)
-					dst_chr = u8(C.strtol(&char(&digits[0]), &char(0), 16))
+					dst_chr = u8(C.strtol(&char(&digits[0]), nil, 16))
 				}
 			}
 		} else {
@@ -1636,7 +1689,8 @@ fn x11_on_focusout(event &C.XEvent) {
 fn x11_on_keypress(event &C.XEvent) {
 	unsafe {
 		keycode := int(event.xkey.keycode)
-		key := x11_translate_key(keycode)
+		keysym := x11_lookup_keysym(event)
+		key := x11_translate_event_key(keycode, keysym)
 		repeat := x11_keypress_repeat(keycode)
 		mut mods := x11_mods(event.xkey.state)
 		// X11 doesn't set modifier bit on key down, so emulate that
@@ -1644,8 +1698,6 @@ fn x11_on_keypress(event &C.XEvent) {
 		if key != .invalid {
 			x11_key_event(.key_down, key, repeat, mods)
 		}
-		mut keysym := KeySym(0)
-		C.XLookupString(&event.xkey, nil, 0, &keysym, nil)
 		chr := x11_keysym_to_unicode(keysym)
 		if chr > 0 {
 			x11_char_event(u32(chr), repeat, mods)
@@ -1656,7 +1708,8 @@ fn x11_on_keypress(event &C.XEvent) {
 fn x11_on_keyrelease(event &C.XEvent) {
 	unsafe {
 		keycode := int(event.xkey.keycode)
-		key := x11_translate_key(keycode)
+		keysym := x11_lookup_keysym(event)
+		key := x11_translate_event_key(keycode, keysym)
 		x11_keyrelease_repeat(keycode)
 		if key != .invalid {
 			mut mods := x11_mods(event.xkey.state)
@@ -1751,8 +1804,8 @@ fn x11_on_selectionnotify(event &C.XEvent) {
 	unsafe {
 		if event.xselection.property == g_sapp_state.x11.xdnd.xdnd_selection {
 			mut data := &u8(nil)
-			result := x11_get_window_property(event.xselection.requestor, event.xselection.property,
-				event.xselection.target, &&u8(&data))
+			result := x11_get_window_property(event.xselection.requestor,
+				event.xselection.property, event.xselection.target, &&u8(&data))
 			if g_sapp_state.drop.enabled && result > 0 {
 				if x11_parse_dropped_files_list(&char(data)) {
 					g_sapp_state.mouse.dx = 0.0
@@ -1799,11 +1852,12 @@ fn x11_on_selectionrequest(event &C.XEvent) {
 		reply.xselection.target = req.target
 
 		if req.target == g_sapp_state.x11.utf8_string {
-			C.XChangeProperty(g_sapp_state.x11.display, req.requestor, req.property, g_sapp_state.x11.utf8_string,
-				8, prop_mode_replace, &u8(g_sapp_state.clipboard.buffer), int(C.strlen(g_sapp_state.clipboard.buffer)))
+			C.XChangeProperty(g_sapp_state.x11.display, req.requestor, req.property,
+				g_sapp_state.x11.utf8_string, 8, prop_mode_replace,
+				&u8(g_sapp_state.clipboard.buffer), int(C.strlen(g_sapp_state.clipboard.buffer)))
 		} else if req.target == g_sapp_state.x11.targets {
-			C.XChangeProperty(g_sapp_state.x11.display, req.requestor, req.property, xa_atom,
-				32, prop_mode_replace, &u8(&g_sapp_state.x11.utf8_string), 1)
+			C.XChangeProperty(g_sapp_state.x11.display, req.requestor, req.property, xa_atom, 32,
+				prop_mode_replace, &u8(&g_sapp_state.x11.utf8_string), 1)
 		} else {
 			reply.xselection.property = x_none
 		}
@@ -1829,11 +1883,11 @@ fn x11_on_clientmessage(event &C.XEvent) {
 			if g_sapp_state.x11.xdnd.version > x11_xdnd_version {
 				return
 			}
-			mut count := u64(0)
+			mut count := usize(0)
 			mut formats := &Atom(nil)
 			if is_list {
-				count = x11_get_window_property(g_sapp_state.x11.xdnd.source, g_sapp_state.x11.xdnd.xdnd_type_list,
-					xa_atom, &&u8(&formats))
+				count = x11_get_window_property(g_sapp_state.x11.xdnd.source,
+					g_sapp_state.x11.xdnd.xdnd_type_list, xa_atom, &&u8(&formats))
 			} else {
 				count = 3
 				formats = &Atom(voidptr(&event.xclient.data.l[2]))

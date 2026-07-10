@@ -98,7 +98,7 @@ fn C.sapp_get_clipboard_string() &char
 fn C.sapp_set_window_title(&char)
 
 // set the window icon (only on Windows and Linux)
-fn C.sapp_set_icon(icon_desc &IconDesc)
+fn C.sapp_set_icon(const_icon_desc &IconDesc)
 
 // Get number of dropped files
 fn C.sapp_get_num_dropped_files() i32
@@ -107,13 +107,17 @@ fn C.sapp_get_num_dropped_files() i32
 fn C.sapp_get_dropped_file_path(i32) &char
 
 // special run-function for SOKOL_NO_ENTRY (in standard mode this is an empty stub)
-fn C.sapp_run(desc &Desc) i32
+fn C.sapp_run(const_desc &Desc) i32
 
 // get runtime environment information
 fn C.sapp_get_environment() Environment
 
 // get current frame's swapchain information (call once per frame!)
 fn C.sapp_get_swapchain() Swapchain
+
+// V-private wrappers around sapp_get_environment/sapp_get_swapchain for sharedlive DLL boundaries
+fn C.v_sapp_get_environment(out_env &Environment)
+fn C.v_sapp_get_swapchain(out_swapchain &Swapchain)
 
 // EGL: get EGLDisplay object
 fn C.sapp_egl_get_display() voidptr
@@ -160,5 +164,5 @@ fn C.sapp_x11_get_display() voidptr
 // Android: get native activity handle
 fn C.sapp_android_get_native_activity() voidptr
 
-// V-specific: read RGBA pixels from the OpenGL framebuffer
-fn C.v_sapp_gl_read_rgba_pixels(x i32, y i32, width i32, height i32, pixels charptr)
+// V-specific: read RGBA pixels from the active backend framebuffer
+fn C.v_sapp_read_rgba_pixels(x int, y int, width int, height int, pixels charptr) int

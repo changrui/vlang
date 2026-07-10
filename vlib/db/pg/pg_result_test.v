@@ -34,7 +34,7 @@ fn test_large_exec() {
 		return
 	}
 
-	db := pg.connect(pg.Config{ user: 'postgres', password: '12345678', dbname: 'postgres' })!
+	mut db := pg.connect(pg.Config{ user: 'postgres', password: '12345678', dbname: 'postgres' })!
 	defer {
 		db.close() or {}
 	}
@@ -54,4 +54,31 @@ WHERE
 	assert result.rows.len > 0 && infos.len == result.rows.len
 
 	// println(infos)
+}
+
+fn test_empty_result_set_returns_col_names() {
+	$if !network ? {
+		eprintln('> Skipping test ${@FN}, since `-d network` is not passed.')
+		eprintln('> This test requires a working postgres server running on localhost.')
+		return
+	}
+
+	mut db := pg.connect(pg.Config{
+		user:     'postgres'
+		password: '12345678'
+		dbname:   'postgres'
+	})!
+	defer {
+		db.close() or {}
+	}
+
+	// Query that returns column metadata but zero tuples
+	result := db.exec_result('SELECT 1 AS id WHERE false')!
+
+	assert result.names.len == 1
+	assert result.names[0] == 'id'
+	assert result.cols == {
+		'id': 0
+	}
+	assert result.rows.len == 0
 }

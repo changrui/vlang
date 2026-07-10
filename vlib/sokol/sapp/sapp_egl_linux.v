@@ -4,7 +4,7 @@ module sapp
 // Shared between Wayland and X11 backends.
 
 fn sapp_egl_choose_config() EGLConfig {
-	sample_count := if g_sapp_state.desc.sample_count > 1 {
+	samples := if g_sapp_state.desc.sample_count > 1 {
 		EGLint(g_sapp_state.desc.sample_count)
 	} else {
 		EGLint(0)
@@ -32,7 +32,7 @@ fn sapp_egl_choose_config() EGLConfig {
 		egl_sample_buffers,
 		sample_buffers,
 		egl_samples,
-		sample_count,
+		samples,
 		egl_none,
 	]!
 
@@ -61,7 +61,7 @@ fn sapp_egl_choose_config() EGLConfig {
 			&& C.eglGetConfigAttrib(g_sapp_state.egl.display, c, egl_depth_size, &d) != 0
 			&& C.eglGetConfigAttrib(g_sapp_state.egl.display, c, egl_stencil_size, &s) != 0
 			&& C.eglGetConfigAttrib(g_sapp_state.egl.display, c, egl_samples, &n) != 0 && r == 8
-			&& g == 8 && b == 8 && a == alpha_size && d == 24 && s == 8 && n == sample_count {
+			&& g == 8 && b == 8 && a == alpha_size && d == 24 && s == 8 && n == samples {
 			config = c
 			break
 		}
@@ -112,8 +112,8 @@ fn sapp_egl_create_surface(native_window voidptr) {
 }
 
 fn sapp_egl_make_current() {
-	if C.eglMakeCurrent(g_sapp_state.egl.display, g_sapp_state.egl.surface, g_sapp_state.egl.surface,
-		g_sapp_state.egl.context) == 0 {
+	if C.eglMakeCurrent(g_sapp_state.egl.display, g_sapp_state.egl.surface,
+		g_sapp_state.egl.surface, g_sapp_state.egl.context) == 0 {
 		eprintln('sokol_app: EGL: eglMakeCurrent failed')
 	}
 	mut fb := i32(0)
@@ -172,8 +172,8 @@ fn sapp_egl_init_x11() {
 	visual_info_template.visualid = VisualID(visual_id)
 
 	mut num_visuals := 0
-	visual_info := C.XGetVisualInfo(g_sapp_state.x11.display, visual_id_mask, &visual_info_template,
-		&num_visuals)
+	visual_info := C.XGetVisualInfo(g_sapp_state.x11.display, visual_id_mask,
+		&visual_info_template, &num_visuals)
 	if visual_info == unsafe { nil } {
 		eprintln('sokol_app: EGL: failed to get visual info')
 	}

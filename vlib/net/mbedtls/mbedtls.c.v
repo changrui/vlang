@@ -2,6 +2,7 @@ module mbedtls
 
 #flag -I @VEXEROOT/thirdparty/mbedtls/library
 #flag -I @VEXEROOT/thirdparty/mbedtls/include
+#flag windows -DWIN32_LEAN_AND_MEAN
 // #flag -D _FILE_OFFSET_BITS=64
 #flag -I @VEXEROOT/thirdparty/mbedtls/3rdparty/everest/include
 #flag -I @VEXEROOT/thirdparty/mbedtls/3rdparty/everest/include/everest
@@ -135,6 +136,21 @@ $if prod && opt_size ? {
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/error.h>
+#include <mbedtls/threading.h>
+#insert "@VEXEROOT/vlib/net/mbedtls/mbedtls_helpers.h"
+#insert "@VEXEROOT/vlib/net/mbedtls/mbedtls_threading.h"
+
+// v_mbedtls_threading_setup installs the mutex callbacks mbedtls needs when it
+// is built with MBEDTLS_THREADING_ALT (Windows). On platforms that use pthread
+// threading or no threading it is a no-op. Defined in mbedtls_threading.h.
+fn C.v_mbedtls_threading_setup()
+
+// init installs mbedtls' thread-safety callbacks once, before any TLS use, so
+// the library's shared state (RNG, key blinding, internal globals) is safe to
+// use across threads. A no-op on non-Windows builds.
+fn init() {
+	C.v_mbedtls_threading_setup()
+}
 
 @[typedef]
 pub struct C.mbedtls_net_context {
@@ -176,15 +192,17 @@ fn C.mbedtls_net_init(&C.mbedtls_net_context)
 fn C.mbedtls_net_connect(&C.mbedtls_net_context, &char, &char, i32) i32
 fn C.mbedtls_net_bind(&C.mbedtls_net_context, &char, &char, i32) i32
 fn C.mbedtls_net_accept(&C.mbedtls_net_context, &C.mbedtls_net_context, voidptr, usize, &usize) i32
+fn C.mbedtls_net_recv(voidptr, &u8, usize) i32
+fn C.mbedtls_net_send(voidptr, &u8, usize) i32
+fn C.mbedtls_net_recv_timeout(voidptr, &u8, usize, u32) i32
 fn C.mbedtls_net_free(&C.mbedtls_net_context)
 
 fn C.mbedtls_ssl_init(&C.mbedtls_ssl_context)
 fn C.mbedtls_ssl_setup(&C.mbedtls_ssl_context, &C.mbedtls_ssl_config) i32
 fn C.mbedtls_ssl_session_reset(&C.mbedtls_ssl_context)
 fn C.mbedtls_ssl_conf_authmode(&C.mbedtls_ssl_config, i32)
-fn C.mbedtls_ssl_conf_rng(&C.mbedtls_ssl_config, fn (voidptr, &u8, usize) int, &C.mbedtls_ctr_drbg_context)
-fn C.mbedtls_ssl_set_bio(&C.mbedtls_ssl_context, &C.mbedtls_net_context, &C.mbedtls_ssl_send_t, &C.mbedtls_ssl_recv_t,
-	&C.mbedtls_ssl_recv_timeout_t)
+fn C.mbedtls_ssl_conf_rng(&C.mbedtls_ssl_config, fn (voidptr, &u8, usize) int, voidptr)
+fn C.mbedtls_ssl_set_bio(&C.mbedtls_ssl_context, &C.mbedtls_net_context, fn (voidptr, &u8, usize) i32, fn (voidptr, &u8, usize) i32, fn (voidptr, &u8, usize, u32) i32)
 fn C.mbedtls_ssl_conf_own_cert(&C.mbedtls_ssl_config, &C.mbedtls_x509_crt, &C.mbedtls_pk_context) i32
 fn C.mbedtls_ssl_conf_ca_chain(&C.mbedtls_ssl_config, &C.mbedtls_x509_crt, &C.mbedtls_x509_crl)
 fn C.mbedtls_ssl_set_hostname(&C.mbedtls_ssl_context, &char) i32
@@ -195,7 +213,7 @@ fn C.mbedtls_ssl_free(&C.mbedtls_ssl_context)
 fn C.mbedtls_ssl_config_init(&C.mbedtls_ssl_config)
 fn C.mbedtls_ssl_config_defaults(&C.mbedtls_ssl_config, i32, i32, i32) i32
 fn C.mbedtls_ssl_config_free(&C.mbedtls_ssl_config)
-fn C.mbedtls_ssl_conf_sni(&C.mbedtls_ssl_config, fn (voidptr, &C.mbedtls_ssl_context, &char, int) int, voidptr)
+fn C.mbedtls_ssl_conf_sni(&C.mbedtls_ssl_config, fn (voidptr, &C.mbedtls_ssl_context, &u8, usize) int, voidptr)
 fn C.mbedtls_ssl_set_hs_ca_chain(&C.mbedtls_ssl_config, &C.mbedtls_x509_crt, &C.mbedtls_x509_crl)
 fn C.mbedtls_ssl_set_hs_own_cert(&C.mbedtls_ssl_context, &C.mbedtls_x509_crt, &C.mbedtls_pk_context) i32
 fn C.mbedtls_ssl_set_hs_authmode(&C.mbedtls_ssl_context, i32)
@@ -226,4 +244,10 @@ fn C.mbedtls_debug_set_threshold(level i32)
 
 fn C.mbedtls_ssl_conf_read_timeout(conf &C.mbedtls_ssl_config, timeout u32)
 
-fn C.mbedtls_ssl_conf_alpn_protocols(&C.mbedtls_ssl_config, &&char) i32
+// protos is `const char **`; declared as voidptr so V emits a clean
+// `(void*)` cast and avoids -cstrict nested-pointer const warnings.
+fn C.mbedtls_ssl_conf_alpn_protocols(conf &C.mbedtls_ssl_config, protos voidptr) i32
+
+fn C.mbedtls_ssl_get_alpn_protocol(&C.mbedtls_ssl_context) voidptr
+
+fn C.v_mbedtls_ssl_set_bio_nonblocking(&C.mbedtls_ssl_context, &C.mbedtls_net_context)

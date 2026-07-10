@@ -69,9 +69,9 @@ fn C._wstat64(&u16, voidptr) u64
 
 fn C.chown(&char, i32, i32) i32
 
-fn C.ftruncate(voidptr, u64) i32
+fn C.ftruncate(i32, u64) i32
 
-fn C._chsize_s(voidptr, u64) i32
+fn C._chsize_s(i32, u64) i32
 
 // read_bytes returns all bytes read from file in `path`.
 @[manualfree]
@@ -107,8 +107,14 @@ fn find_cfile_size(fp &C.FILE) !int {
 	if raw_fsize != 0 && cseek != 0 {
 		return error('fseek failed')
 	}
-	if cseek != 0 && raw_fsize < 0 {
-		return error('ftell failed')
+	if raw_fsize < 0 {
+		if cseek != 0 {
+			return error('ftell failed')
+		}
+		// fseek succeeded but ftell returned -1 (e.g. device files like NUL on Windows).
+		// Rewind before returning so the caller can read from the beginning.
+		C.rewind(fp)
+		return 0
 	}
 	len := int(raw_fsize)
 	// For files > 2GB, C.ftell can return values that, when cast to `int`, can result in values below 0.
@@ -130,14 +136,14 @@ fn slurp_file_in_builder(fp &C.FILE) !strings.Builder {
 	buf := [buf_size]u8{}
 	mut sb := strings.new_builder(buf_size)
 	for {
-		mut read_bytes := fread(&buf[0], 1, buf_size, fp) or {
+		mut nbytes := fread(&buf[0], 1, buf_size, fp) or {
 			if err is Eof {
 				break
 			}
 			unsafe { sb.free() }
 			return err
 		}
-		unsafe { sb.write_ptr(&buf[0], read_bytes) }
+		unsafe { sb.write_ptr(&buf[0], nbytes) }
 	}
 	return sb
 }
@@ -241,7 +247,8 @@ pub fn rename_dir(src string, dst string) ! {
 pub fn rename(src string, dst string) ! {
 	mut rdst := dst
 	if is_dir(rdst) {
-		rdst = join_path_single(rdst.trim_right(path_separator), file_name(src.trim_right(path_separator)))
+		rdst = join_path_single(rdst.trim_right(path_separator),
+			file_name(src.trim_right(path_separator)))
 	}
 	$if windows {
 		w_src := src.replace('/', '\\')
@@ -668,22 +675,15 @@ pub fn get_raw_line() string {
 
 		mut str := ''
 		nr_chars := unsafe { C.getline(voidptr(&buf), &max, C.stdin) }
-		// On OpenBSD, buf=0 for EOF =>  panic when calling tos function
-		$if openbsd {
-			if nr_chars != -1 {
-				str = unsafe { tos(buf, nr_chars) }
-			} else {
-				if int(C.feof(C.stdin)) == 0 && int(C.ferror(C.stdin)) != 0 {
-					panic('get_raw_line(): error to read string')
-				}
-			}
-		} $else {
-			str = unsafe { tos(buf, if nr_chars < 0 { 0 } else { nr_chars }) }
+		if nr_chars >= 0 && buf != 0 {
+			str = unsafe { tos(buf, nr_chars) }
+		} else if int(C.feof(C.stdin)) == 0 && int(C.ferror(C.stdin)) != 0 {
+			panic('get_raw_line(): error reading from stdin')
 		}
 		ret := str.clone()
 		$if !autofree {
 			unsafe {
-				if nr_chars > 0 && buf != 0 {
+				if buf != 0 {
 					C.free(buf)
 				}
 			}
@@ -792,10 +792,7 @@ pub fn executable() string {
 					defer {
 						unsafe { sret.free() }
 					}
-					// remove '\\?\' from beginning (see link above)
-					sret_slice := sret[4..]
-					res := sret_slice.clone()
-					return res
+					return normalize_windows_extended_path_prefix(sret)
 				} else if final_len != 0 {
 					eprintln('os.executable() saw that the executable file path was too long')
 				}
@@ -918,10 +915,27 @@ pub fn getwd() string {
 	}
 }
 
+// normalize_windows_extended_path_prefix converts Win32 extended-length paths from
+// `GetFinalPathNameByHandleW` back to standard DOS and UNC paths.
+@[manualfree]
+fn normalize_windows_extended_path_prefix(path string) string {
+	$if windows {
+		if path.starts_with('\\\\?\\UNC\\') || path.starts_with('\\\\.\\UNC\\') {
+			return ('\\\\' + path[8..]).clone()
+		}
+		if path.starts_with('\\\\?\\') || path.starts_with('\\\\.\\') {
+			return path[4..].clone()
+		}
+	}
+	return path.clone()
+}
+
 // real_path returns the full absolute path for fpath, with all relative ../../, symlinks and so on resolved.
 // See http://pubs.opengroup.org/onlinepubs/9699919799/functions/realpath.html
 // Also https://insanecoding.blogspot.com/2007/11/pathmax-simply-isnt.html
 // and https://insanecoding.blogspot.com/2007/11/implementing-realpath-in-c.html
+// On Windows, extended-length path prefixes like `\\?\` and `\\?\UNC\` are normalized back
+// to standard DOS and UNC paths.
 // Note: this particular rabbit hole is *deep* ...
 @[manualfree]
 pub fn real_path(fpath string) string {
@@ -942,13 +956,14 @@ pub fn real_path(fpath string) string {
 		if file != voidptr(-1) {
 			defer { C.CloseHandle(file) }
 			// https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew
-			final_len := C.GetFinalPathNameByHandleW(file, pu16_fullpath, max_path_buffer_size,
-				0)
+			final_len := C.GetFinalPathNameByHandleW(file, pu16_fullpath, max_path_buffer_size, 0)
 			if final_len < u32(max_path_buffer_size) && final_len != 0 {
 				rt := unsafe { string_from_wide2(pu16_fullpath, int(final_len)) }
-				srt := rt[4..]
+				defer {
+					unsafe { rt.free() }
+				}
 				unsafe { res.free() }
-				res = srt.clone()
+				res = normalize_windows_extended_path_prefix(rt)
 			} else {
 				if final_len != 0 {
 					eprintln('os.real_path() saw that the file path was too long')
@@ -965,7 +980,7 @@ pub fn real_path(fpath string) string {
 				return fpath.clone()
 			}
 			unsafe { res.free() }
-			res = unsafe { string_from_wide(pu16_fullpath) }
+			res = normalize_windows_extended_path_prefix(unsafe { string_from_wide(pu16_fullpath) })
 		}
 	} $else {
 		ret := &char(C.realpath(&char(fpath.str), &char(&fullpath[0])))
@@ -996,8 +1011,8 @@ fn normalize_drive_letter(path string) {
 	// vfmt off
 	if path.len > 2 && path[0] >= `a` && path[0] <= `z` && path[1] == `:` && path[2] == path_separator[0] {
 		unsafe {
-			x := &path.str[0]
-			(*x) = *x - 32
+			mut x := &u8(path.str)
+			x[0] = x[0] - 32
 		}
 	}
 	// vfmt on
@@ -1040,7 +1055,11 @@ pub fn file_last_mod_unix(path string) i64 {
 
 // flush will flush the stdout buffer.
 pub fn flush() {
-	C.fflush(C.stdout)
+	$if v2_native_windows_pe_minimal ? {
+		return
+	} $else {
+		C.fflush(C.stdout)
+	}
 }
 
 // chmod change file access attributes of `path` to `mode`.
@@ -1146,9 +1165,30 @@ pub fn execve(cmdpath string, cmdargs []string, envs []string) ! {
 pub fn is_atty(fd int) int {
 	$if windows {
 		mut mode := u32(0)
-		osfh := voidptr(C._get_osfhandle(fd))
-		C.GetConsoleMode(osfh, voidptr(&mode))
-		return int(mode)
+		$if v2_native_windows_pe_minimal ? {
+			if fd != 0 && fd != 1 && fd != 2 {
+				return 0
+			}
+			handle_id := if fd == 0 {
+				C.STD_INPUT_HANDLE
+			} else if fd == 2 {
+				C.STD_ERROR_HANDLE
+			} else {
+				C.STD_OUTPUT_HANDLE
+			}
+			handle := C.GetStdHandle(handle_id)
+			if isnil(handle) || handle == C.INVALID_HANDLE_VALUE {
+				return 0
+			}
+			if !C.GetConsoleMode(handle, voidptr(&mode)) {
+				return 0
+			}
+			return int(mode)
+		} $else {
+			osfh := voidptr(C._get_osfhandle(fd))
+			C.GetConsoleMode(osfh, voidptr(&mode))
+			return int(mode)
+		}
 	} $else {
 		return C.isatty(fd)
 	}

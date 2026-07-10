@@ -89,6 +89,7 @@ pub fn (mut tx Tx) commit() ! {
 			tx.inner.conn.orm_release_savepoint(tx.inner.savepoint_name)!
 		}
 	}
+
 	tx.inner.active = false
 }
 
@@ -105,6 +106,7 @@ pub fn (mut tx Tx) rollback() ! {
 			tx.inner.conn.orm_release_savepoint(tx.inner.savepoint_name)!
 		}
 	}
+
 	tx.inner.active = false
 }
 
@@ -194,9 +196,10 @@ fn (sp Savepoint) ensure_active(action string) ! {
 	if isnil(sp.inner) {
 		return error('savepoint is not initialized')
 	}
-	if !sp.inner.active || isnil(sp.inner.owner) || !Tx{
+	owner_tx := Tx{
 		inner: sp.inner.owner
-	}.is_active() {
+	}
+	if !sp.inner.active || isnil(sp.inner.owner) || !owner_tx.is_active() {
 		return error('savepoint is inactive; cannot ${action}')
 	}
 }
@@ -243,4 +246,10 @@ pub fn (mut tx Tx) last_id() int {
 		return 0
 	}
 	return tx.inner.conn.last_id()
+}
+
+// execute forwards raw SQL execution through the active transaction and returns the result rows.
+pub fn (mut tx Tx) execute(query string) ![]Row {
+	tx.ensure_active('use the transaction')!
+	return tx.inner.conn.execute(query)
 }

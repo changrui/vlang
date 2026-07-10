@@ -3,6 +3,9 @@
 V has a powerful, concise ORM baked in! Create tables, insert records, manage relationships, all
 regardless of the DB driver you decide to use.
 
+Driver authors using the shared SQL generators can target SQLite, PostgreSQL, MySQL, and
+H2-backed connections with the built-in ORM dialect helpers.
+
 ## Nullable
 
 For a nullable column, use an option field. If the field is non-option, the column will be defined
@@ -23,6 +26,7 @@ struct Foo {
 - `[table: 'name']` explicitly sets the name of the table for the struct
 - `[comment: 'table_comment']` explicitly sets the comment of the table for the struct
 - `[index: 'f1, f2, f3']` explicitly sets fields of the table (`f1`, `f2`, `f3`) as indexed
+- `[unique_key: 'f1, f2, f3']` adds a composite `UNIQUE` constraint for the listed fields
 
 ### Fields
 
@@ -89,6 +93,73 @@ sql db {
 }!
 ```
 
+### Data Scope
+
+`orm.DB` can wrap an `orm.Connection` with automatic scope filters. Scope filters
+are useful for request-level tenancy, soft deletes, and row-level access checks.
+
+```v ignore
+mut db := orm.new_db(raw_db, orm.DataScope{
+    filters: [
+        orm.QueryFilter{
+            field: 'tenant_id'
+            value: orm.Primitive(tenant_id)
+            mode:  .dynamic
+        },
+        orm.QueryFilter{
+            field: 'shop_id'
+            value: orm.Primitive(shop_id)
+            mode:  .dynamic
+        },
+        orm.QueryFilter{
+            field:    'deleted_at'
+            operator: .is_null
+            mode:     .dynamic
+        },
+    ]
+})
+
+users := sql db {
+    select from User
+}!
+```
+
+`QueryFilter.mode` must be explicitly set to `.static` or `.dynamic` (there is
+no default — `.unset` causes a runtime error). Static filters are reserved for
+future compiler-generated scope clauses. The runtime `orm.DB` wrapper applies
+only filters explicitly marked with `mode: .dynamic`. Invalid dynamic filters
+return an error instead of being silently skipped.
+
+Call `db.unscoped()` to return a new `orm.DB` value that skips all scope filters.
+Call `db.unscoped('tenant_id')` to skip only selected fields.
+
+### Raw SQL Execute
+
+Use `execute(query string) ![]orm.Row` when you need a driver-agnostic raw SQL
+escape hatch outside the `sql db {}` DSL. It is part of the public
+`orm.Connection` interface, and both `orm.DB.execute` and `orm.Tx.execute`
+forward to the wrapped connection.
+
+```v ignore
+rows := db.execute("SELECT 1 AS answer, 'ok' AS status")!
+assert rows[0].names == ['answer', 'status']
+assert rows[0].vals == ['1', 'ok']
+```
+
+Each `orm.Row` stores column values in `vals` and column names in `names`; both
+arrays use the same column order. Queries that do not return a result set, such
+as DDL or DML statements, return an empty row array. Custom `orm.Connection`
+implementers must implement `execute` and should populate `Row.names` whenever
+the backend exposes result column metadata.
+
+> [!TIP]
+> This guide uses the built-in `db.sqlite` module. If you want SQLite without first installing
+> system-level SQLite development files, the V team also maintains the
+> [`sqlite`](https://vpm.vlang.io/packages/sqlite) VPM package.
+>
+> Install it with `v install sqlite` and change `import db.sqlite` to `import sqlite`.
+> The package keeps the same API while bundling SQLite for you.
+
 When you need to reference the table, simply pass the struct itself.
 
 ```v ignore
@@ -147,6 +218,27 @@ foo_id := sql db {
 }!
 ```
 
+You can insert a flat array of records in one statement. Bulk inserts currently
+support primitive, enum, and `time.Time` fields. Rows with `serial` or `default`
+fields fall back to per-row inserts so each row keeps normal default handling.
+
+```v ignore
+users := [
+    User{
+        id:   1
+        name: 'Alice'
+    },
+    User{
+        id:   2
+        name: 'Bob'
+    },
+]
+
+sql db {
+    insert users into User
+}!
+```
+
 If the `id` field is marked as `sql: serial` and `primary`, the insert expression
 returns the database ID of the newly added object. Getting an ID of a newly
 added DB row is often useful.
@@ -156,6 +248,24 @@ attribute, are not sent to the database when the value being sent is the default
 for the V struct field (e.g., 0 int, or an empty string).  This allows the
 database to insert default values for auto-increment fields and where you have
 specified a default.
+
+### Upsert
+
+`upsert` inserts a row or updates the matching row when one of the table's
+primary or unique keys already exists.
+
+```v ignore
+foo := Foo{
+    name: 'abc'
+}
+
+sql db {
+    upsert foo into Foo
+}!
+```
+
+`upsert` currently supports flat ORM rows with primitive, enum, and `time.Time`
+fields.
 
 ### Select
 
@@ -171,6 +281,17 @@ result := sql db {
 foo := result.first()
 ```
 
+You can also select a subset of struct fields. The result type stays `[]Foo`;
+the selected fields are populated and the rest keep their zero values. Use the
+V struct field names here; `@[sql: 'column_name']` and `@[sql_select: 'expr']`
+are still applied automatically.
+
+```v ignore
+partial := sql db {
+    select id, name from Foo where id > 1
+}!
+```
+
 ```v ignore
 result := sql db {
     select from Foo where id > 1 && name != 'lasanha' limit 5
@@ -180,6 +301,33 @@ result := sql db {
 ```v ignore
 result := sql db {
     select from Foo where id > 1 order by id desc
+}!
+```
+
+Dynamic ORM blocks can build `WHERE` and `SET` data conditionally. Commas between
+emitted dynamic `where` items are joined with `AND`; use `&&` and `||` inside an
+item for explicit boolean conditions.
+
+```v ignore
+where_filter := {
+    if name := req.name {
+        name == name
+    },
+    id == user_id || tenant_id == tenant_id
+}
+
+rows := sql db {
+    dynamic select from Foo where where_filter
+}!
+
+update_data := {
+    name == new_name
+}
+
+sql db {
+    dynamic update Foo set update_data where {
+        id == user_id || tenant_id == tenant_id
+    }
 }!
 ```
 
@@ -265,6 +413,42 @@ as the table.
 sql db {
     update Foo set updated_at = time.now() where name == 'abc' && updated_at is none
 }!
+```
+
+You can update multiple rows from an array in one statement by using the array
+variable in each assigned value and in the key comparison.
+
+```v ignore
+updates := [
+    User{
+        id:   1
+        name: 'Alicia'
+    },
+    User{
+        id:   2
+        name: 'Robert'
+    },
+]
+
+sql db {
+    update User set name = updates.name where id == updates.id
+}!
+```
+
+For a Rails-style full-record save, load a struct, mutate it, then call `orm.save`.
+The helper uses the struct primary key, or an `id` field when present, for the
+`WHERE` clause and updates the remaining mapped fields automatically.
+
+```v ignore
+import orm
+
+mut foo := (sql db {
+    select from Foo where id == 1
+}!).first()
+foo.name = 'updated'
+foo.updated_at = time.now()
+
+orm.save(db, foo)!
 ```
 
 Note that `is none` and `!is none` can be used to select for NULL fields.
@@ -406,6 +590,16 @@ struct User {
 	qb.set('age = ?, title = ?', 71, 'boss')!.where('name = ?','John')!.update()!
 ```
 
+For a full-record update without spelling out each `set(...)` clause, use `orm.save`:
+
+```v ignore
+	selected := qb.where('name = ?', 'John')!.query()!
+	mut john := selected.first()
+	john.age = 72
+	john.title = 'lead'
+	orm.save(db, john)!
+```
+
 9. Query aggregate values​​:
 
 ```v ignore
@@ -424,6 +618,12 @@ struct User {
 `sum`, `avg`, `min`, and `max` return an `AggregateValue`. Use
 `as_int()`, `as_f64()`, `as_string()`, or `as_time()` to unwrap the typed
 value, or check `has_value` for empty result sets. `count` returns `int`.
+
+To remove duplicate rows from a query, mark it as `DISTINCT` before `query()`:
+
+```v ignore
+	distinct_roles := qb.select('role')!.distinct()!.query()!
+```
 
 9. Drop the table​​:
 
@@ -454,3 +654,9 @@ The API includes a built-in parser to handle intricate `WHERE` clause conditions
 
 Note the use of placeholders `?`.
 The conditional expressions support logical operators including `AND`, `OR`, `||`, and `&&`.
+Named arrays can also be passed directly for `IN` clauses:
+
+```v ignore
+	user_ids := ['1', '2']
+	users := qb.where('id IN ?', user_ids)!.query()!
+```

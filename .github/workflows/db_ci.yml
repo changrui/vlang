@@ -3,7 +3,10 @@ name: Database CI
 on:
   workflow_dispatch:
   push:
+    branches:
+      - master
     paths-ignore:
+      - 'vlib/v3/**'
       - '**.md'
       - '**.yml'
       - '!**/db_ci.yml'
@@ -11,6 +14,7 @@ on:
       - 'doc/**'
   pull_request:
     paths-ignore:
+      - 'vlib/v3/**'
       - '**.md'
       - '**.yml'
       - '!**/db_ci.yml'
@@ -39,7 +43,7 @@ jobs:
           --health-timeout=5s
           --health-retries=24
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build V
         run: make -j4 && ./v symlink
       - name: Install mysql client headers
@@ -66,7 +70,7 @@ jobs:
           --health-timeout=5s
           --health-retries=24
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build V
         run: make -j4 && ./v symlink
       - name: Install postgres client headers
@@ -90,7 +94,7 @@ jobs:
         ports:
           - 1433:1433
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build V
         run: make -j4 && ./v symlink
       - name: Install ODBC dependencies

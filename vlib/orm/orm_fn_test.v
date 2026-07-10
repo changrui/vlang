@@ -47,6 +47,78 @@ fn test_orm_stmt_gen_insert() {
 	assert query == "INSERT INTO 'Test' ('test', 'a') VALUES (?0, ?1);"
 }
 
+fn test_orm_stmt_gen_bulk_insert() {
+	table := orm.Table{
+		name: 'Test'
+	}
+	query, converted := orm.orm_stmt_gen(.default, table, "'", .insert, true, '?', 0, orm.QueryData{
+		fields:     ['name', 'age']
+		data:       [orm.Primitive('Alice'), orm.Primitive(25), orm.Primitive('Bob'), orm.Primitive(30)]
+		batch_rows: 2
+	}, orm.QueryData{})
+	assert query == "INSERT INTO 'Test' ('name', 'age') VALUES (?0, ?1), (?2, ?3);"
+	assert converted.data.len == 4
+
+	pg_query, _ := orm.orm_stmt_gen(.pg, table, '"', .insert, true, '$', 1, orm.QueryData{
+		fields:     ['name', 'age']
+		data:       [orm.Primitive('Alice'), orm.Primitive(25), orm.Primitive('Bob'), orm.Primitive(30)]
+		batch_rows: 2
+	}, orm.QueryData{})
+	assert pg_query == 'INSERT INTO "Test" ("name", "age") VALUES ($1, $2), ($3, $4);'
+
+	mysql_query, _ := orm.orm_stmt_gen(.mysql, table, '`', .insert, false, '?', 1, orm.QueryData{
+		fields:     ['name', 'age']
+		data:       [orm.Primitive('Alice'), orm.Primitive(25), orm.Primitive('Bob'), orm.Primitive(30)]
+		batch_rows: 2
+	}, orm.QueryData{})
+	assert mysql_query == 'INSERT INTO `Test` (`name`, `age`) VALUES (?, ?), (?, ?);'
+}
+
+fn test_orm_stmt_gen_bulk_update() {
+	table := orm.Table{
+		name: 'Test'
+	}
+	query, _ := orm.orm_stmt_gen(.default, table, "'", .update, true, '?', 0, orm.QueryData{
+		fields:     ['name', 'age']
+		data:       [orm.Primitive(1), orm.Primitive('Alice'), orm.Primitive(2), orm.Primitive('Bob'),
+			orm.Primitive(1), orm.Primitive(25), orm.Primitive(2), orm.Primitive(30)]
+		batch_rows: 2
+		batch_key:  'id'
+	}, orm.QueryData{
+		fields: ['id', 'id']
+		data:   [orm.Primitive(1), orm.Primitive(2)]
+		kinds:  [.eq, .eq]
+		is_and: [false]
+	})
+	assert query == "UPDATE 'Test' SET 'name' = CASE 'id' WHEN ?0 THEN ?1 WHEN ?2 THEN ?3 ELSE 'name' END, 'age' = CASE 'id' WHEN ?4 THEN ?5 WHEN ?6 THEN ?7 ELSE 'age' END WHERE 'id' = ?8 OR 'id' = ?9;"
+
+	pg_query, _ := orm.orm_stmt_gen(.pg, table, '"', .update, true, '$', 1, orm.QueryData{
+		fields:     ['name']
+		data:       [orm.Primitive(1), orm.Primitive('Alice'), orm.Primitive(2), orm.Primitive('Bob')]
+		batch_rows: 2
+		batch_key:  'id'
+	}, orm.QueryData{
+		fields: ['id', 'id']
+		data:   [orm.Primitive(1), orm.Primitive(2)]
+		kinds:  [.eq, .eq]
+		is_and: [false]
+	})
+	assert pg_query == 'UPDATE "Test" SET "name" = CASE "id" WHEN $1 THEN $2 WHEN $3 THEN $4 ELSE "name" END WHERE "id" = $5 OR "id" = $6;'
+
+	mysql_query, _ := orm.orm_stmt_gen(.mysql, table, '`', .update, false, '?', 1, orm.QueryData{
+		fields:     ['name']
+		data:       [orm.Primitive(1), orm.Primitive('Alice'), orm.Primitive(2), orm.Primitive('Bob')]
+		batch_rows: 2
+		batch_key:  'id'
+	}, orm.QueryData{
+		fields: ['id', 'id']
+		data:   [orm.Primitive(1), orm.Primitive(2)]
+		kinds:  [.eq, .eq]
+		is_and: [false]
+	})
+	assert mysql_query == 'UPDATE `Test` SET `name` = CASE `id` WHEN ? THEN ? WHEN ? THEN ? ELSE `name` END WHERE `id` = ? OR `id` = ?;'
+}
+
 fn test_orm_stmt_gen_insert_default_values_pg() {
 	table := orm.Table{
 		name: 'Test'
@@ -61,6 +133,39 @@ fn test_orm_stmt_gen_insert_default_values_pg() {
 	assert query == "INSERT INTO 'Test' DEFAULT VALUES;"
 	assert converted.fields.len == 0
 	assert converted.data.len == 0
+}
+
+fn test_orm_stmt_gen_insert_default_values_mysql() {
+	table := orm.Table{
+		name: 'Test'
+	}
+	query, converted := orm.orm_stmt_gen(.mysql, table, '`', .insert, false, '?', 1, orm.QueryData{
+		fields:      ['id']
+		data:        [orm.Primitive(0)]
+		auto_fields: [0]
+	}, orm.QueryData{})
+	assert query == 'INSERT INTO `Test` () VALUES ();'
+	assert converted.fields.len == 0
+	assert converted.data.len == 0
+
+	bulk_query, bulk_converted := orm.orm_stmt_gen(.mysql, table, '`', .insert, false, '?', 1, orm.QueryData{
+		fields:      ['id']
+		data:        [orm.Primitive(0), orm.Primitive(0), orm.Primitive(0)]
+		auto_fields: [0]
+		batch_rows:  3
+	}, orm.QueryData{})
+	assert bulk_query == 'INSERT INTO `Test` () VALUES (), (), ();'
+	assert bulk_converted.fields.len == 0
+	assert bulk_converted.data.len == 0
+}
+
+fn test_orm_stmt_gen_h2_insert_default_values() {
+	table := orm.Table{
+		name: 'Test'
+	}
+	query, _ :=
+		orm.orm_stmt_gen(.h2, table, '"', .insert, false, '?', 1, orm.QueryData{}, orm.QueryData{})
+	assert query == 'INSERT INTO "Test" DEFAULT VALUES;'
 }
 
 fn test_orm_stmt_gen_delete() {
@@ -94,6 +199,31 @@ fn test_orm_stmt_gen_delete() {
 		is_and: [false]
 	})
 	assert query_or == "DELETE FROM 'Test' WHERE 'id' >= ?0 OR 'name' = ?1;"
+}
+
+fn test_orm_stmt_gen_where_unary_before_array() {
+	table := orm.Table{
+		name: 'Test'
+	}
+	query, _ := orm.orm_stmt_gen(.default, table, "'", .delete, true, '?', 0, orm.QueryData{}, orm.QueryData{
+		fields: ['deleted_at', 'tenant_id']
+		data:   [orm.Primitive([orm.Primitive(1), orm.Primitive(2)])]
+		kinds:  [.is_null, .in]
+		is_and: [true]
+	})
+	assert query == "DELETE FROM 'Test' WHERE 'deleted_at' IS NULL AND 'tenant_id' IN (?0, ?1);"
+}
+
+fn test_orm_stmt_gen_where_typed_array() {
+	table := orm.Table{
+		name: 'Test'
+	}
+	query, _ := orm.orm_stmt_gen(.default, table, "'", .delete, true, '?', 0, orm.QueryData{}, orm.QueryData{
+		fields: ['tenant_id']
+		data:   [orm.Primitive([1, 2])]
+		kinds:  [.in]
+	})
+	assert query == "DELETE FROM 'Test' WHERE 'tenant_id' IN (?0, ?1);"
 }
 
 fn get_select_fields() []string {
@@ -137,6 +267,21 @@ fn test_orm_select_gen_with_where() {
 	})
 
 	assert query == "SELECT 'id', 'test', 'abc' FROM 'test_table' WHERE 'abc' = ?0 AND 'test' > ?1;"
+}
+
+fn test_orm_select_gen_preserves_embedded_column_dot() {
+	query := orm.orm_select_gen(orm.SelectConfig{
+		table:     orm.Table{
+			name: 'test_table'
+		}
+		fields:    get_select_fields()
+		has_where: true
+	}, "'", true, '?', 0, orm.QueryData{
+		fields: ['Coordinates.latitude']
+		kinds:  [.eq]
+	})
+
+	assert query == "SELECT 'id', 'test', 'abc' FROM 'test_table' WHERE 'Coordinates.latitude' = ?0;"
 }
 
 fn test_orm_select_gen_with_order() {
@@ -408,6 +553,96 @@ fn test_orm_table_gen() {
 		},
 	], sql_type_from_v, false) or { panic(err) }
 	assert mult_unique_query == "CREATE TABLE IF NOT EXISTS 'test_table' ('id' SERIAL DEFAULT 10, 'test' TEXT, 'abc' INT64 DEFAULT 6754, /* test */UNIQUE('test', 'abc'), PRIMARY KEY('id'));"
+
+	table_with_unique := orm.Table{
+		name:  'test_table'
+		attrs: [
+			VAttribute{
+				name:    'unique_key'
+				has_arg: true
+				arg:     'test, abc'
+				kind:    .string
+			},
+		]
+	}
+	table_unique_query := orm.orm_table_gen(.default, table_with_unique, "'", true, 0, [
+		orm.TableField{
+			name:        'id'
+			typ:         typeof[int]().idx
+			nullable:    true
+			default_val: '10'
+			attrs:       [
+				VAttribute{
+					name: 'primary'
+				},
+				VAttribute{
+					name:    'sql'
+					has_arg: true
+					arg:     'serial'
+					kind:    .plain
+				},
+			]
+		},
+		orm.TableField{
+			name:     'test'
+			typ:      typeof[string]().idx
+			nullable: true
+		},
+		orm.TableField{
+			name:        'abc'
+			typ:         typeof[i64]().idx
+			nullable:    true
+			default_val: '6754'
+		},
+	], sql_type_from_v, false) or { panic(err) }
+	assert table_unique_query == "CREATE TABLE IF NOT EXISTS 'test_table' ('id' SERIAL DEFAULT 10, 'test' TEXT, 'abc' INT64 DEFAULT 6754, UNIQUE('test', 'abc'), PRIMARY KEY('id'));"
+}
+
+fn test_orm_table_gen_h2() {
+	table := orm.Table{
+		name:  'test_table'
+		attrs: [
+			VAttribute{
+				name:    'comment'
+				has_arg: true
+				arg:     'test table'
+				kind:    .string
+			},
+		]
+	}
+	query := orm.orm_table_gen(.h2, table, '"', true, 0, [
+		orm.TableField{
+			name:  'id'
+			typ:   typeof[int]().idx
+			attrs: [
+				VAttribute{
+					name: 'primary'
+				},
+				VAttribute{
+					name:    'sql'
+					has_arg: true
+					arg:     'serial'
+					kind:    .plain
+				},
+			]
+		},
+		orm.TableField{
+			name:  'name'
+			typ:   typeof[string]().idx
+			attrs: [
+				VAttribute{
+					name:    'comment'
+					has_arg: true
+					arg:     'display name'
+					kind:    .string
+				},
+				VAttribute{
+					name: 'index'
+				},
+			]
+		},
+	], sql_type_from_v, false) or { panic(err) }
+	assert query == 'CREATE TABLE IF NOT EXISTS "test_table" ("id" SERIAL NOT NULL, "name" TEXT NOT NULL, PRIMARY KEY("id"));\nCOMMENT ON TABLE "test_table" IS \'test table\';\nCOMMENT ON COLUMN "test_table"."name" IS \'display name\';\nCREATE INDEX "idx_test_table" ON "test_table" ("name");'
 }
 
 fn reset_tenant_filter() {

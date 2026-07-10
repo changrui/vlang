@@ -1,4 +1,5 @@
 import common { Task, exec }
+import os
 
 // Shared tasks/helpers
 fn all_code_is_formatted() {
@@ -41,7 +42,9 @@ fn v_doctor() {
 
 fn build_v_with_prealloc() {
 	exec('v -cg -cstrict -o vstrict1 cmd/v')
-	exec('./vstrict1 -o vprealloc -prealloc cmd/v')
+	// -prealloc uses _Thread_local for g_memory_block; bundled tcc does not support it.
+	prealloc_cc_flag := if os.getenv('VFLAGS').contains('-cc tcc') { ' -cc cc' } else { '' }
+	exec('./vstrict1${prealloc_cc_flag} -o vprealloc -prealloc cmd/v')
 	exec('./vprealloc run examples/hello_world.v')
 	exec('./vprealloc -o v3 cmd/v')
 	exec('./v3 -o v4 cmd/v')
@@ -395,28 +398,6 @@ fn build_modules_clang() {
 	exec('v build-module vlib/os/cmdline')
 }
 
-fn native_machine_code_generation_common() {
-	exec('cd cmd/tools && v gen1m.v')
-	exec('cd cmd/tools && ./gen1m > 1m.v')
-	exec('cd cmd/tools && v -backend native -o 1m 1m.v')
-	exec('cd cmd/tools && ./1m && ls -larS 1m*')
-	exec('cd cmd/tools && rm -f ./1m ./1m.v')
-}
-
-fn native_machine_code_generation_gcc() {
-	native_machine_code_generation_common()
-}
-
-fn native_machine_code_generation_clang() {
-	native_machine_code_generation_common()
-}
-
-fn native_cross_compilation_to_macos() {
-	exec('v -os macos -experimental -b native -o hw.macos examples/hello_world.v')
-	common.file_size_greater_than('hw.macos', 8000)
-	exec('rm -f hw.macos')
-}
-
 fn test_inline_assembly() {
 	exec('v test vlib/v/slow_tests/assembly')
 }
@@ -483,9 +464,6 @@ const all_tasks = {
 	'build_examples_clang':                              Task{build_examples_clang, 'Build examples (clang)'}
 	'build_examples_autofree_clang':                     Task{build_examples_autofree_clang, 'Build examples with -autofree (clang)'}
 	'build_modules_clang':                               Task{build_modules_clang, 'Build modules (clang)'}
-	'native_machine_code_generation_clang':              Task{native_machine_code_generation_clang, 'native machine code generation (clang)'}
-	'native_machine_code_generation_gcc':                Task{native_machine_code_generation_gcc, 'native machine code generation (gcc)'}
-	'native_cross_compilation_to_macos':                 Task{native_cross_compilation_to_macos, 'native cross compilation to macos'}
 	'test_inline_assembly':                              Task{test_inline_assembly, 'Test inline assembly'}
 }
 

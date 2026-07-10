@@ -31,7 +31,7 @@ pub fn new_query[T](conn Connection) &QueryBuilder[T] {
 		valid_sql_field_names: meta.map(sql_field_name(it))
 		conn:                  conn
 		config:                SelectConfig{
-			table: table_from_struct[T]()
+			table: table_from_struct[T](meta)
 		}
 		data:                  QueryData{}
 		where:                 QueryData{}
@@ -60,7 +60,7 @@ pub fn (qb_ &QueryBuilder[T]) where(condition string, params ...Primitive) !&Que
 		// skip first field
 		qb.where.is_and << true // and
 	}
-	qb.parse_conditions(condition, params)!
+	qb.parse_conditions(condition, normalize_primitive_arguments(params))!
 	qb.config.has_where = true
 	return qb
 }
@@ -72,9 +72,45 @@ pub fn (qb_ &QueryBuilder[T]) or_where(condition string, params ...Primitive) !&
 		// skip first field
 		qb.where.is_and << false // or
 	}
-	qb.parse_conditions(condition, params)!
+	qb.parse_conditions(condition, normalize_primitive_arguments(params))!
 	qb.config.has_where = true
 	return qb
+}
+
+fn normalize_primitive_arguments(params []Primitive) []Primitive {
+	mut normalized := []Primitive{cap: params.len}
+	for param in params {
+		normalized << primitive_value(param)
+	}
+	return normalized
+}
+
+fn primitive_value(value Primitive) Primitive {
+	return match value {
+		[]bool { primitive_array(value) }
+		[]f32 { primitive_array(value) }
+		[]f64 { primitive_array(value) }
+		[]i16 { primitive_array(value) }
+		[]i64 { primitive_array(value) }
+		[]i8 { primitive_array(value) }
+		[]int { primitive_array(value) }
+		[]string { primitive_array(value) }
+		[]time.Time { primitive_array(value) }
+		[]u16 { primitive_array(value) }
+		[]u32 { primitive_array(value) }
+		[]u64 { primitive_array(value) }
+		[]u8 { primitive_array(value) }
+		[]InfixType { primitive_array(value) }
+		else { value }
+	}
+}
+
+fn primitive_array[T](values []T) []Primitive {
+	mut out := []Primitive{cap: values.len}
+	for value in values {
+		out << Primitive(value)
+	}
+	return out
 }
 
 fn parse_error(msg string, pos int, conds string) ! {
@@ -239,6 +275,7 @@ fn (qb_ &QueryBuilder[T]) parse_conditions(conds string, params []Primitive) ! {
 						OperationKind.eq
 					}
 				}
+
 				if current_op in [.is_null, .is_not_null]! {
 					qb.where.fields << current_field
 					qb.where.kinds << current_op
@@ -283,8 +320,8 @@ fn (qb_ &QueryBuilder[T]) parse_conditions(conds string, params []Primitive) ! {
 					current_is_and = false
 					state = .field
 				} else {
-					parse_error('${@FN}(): unexpected `${tok}`, maybe `AND`,`OR`', s.last_tok_start,
-						conds)!
+					parse_error('${@FN}(): unexpected `${tok}`, maybe `AND`,`OR`',
+						s.last_tok_start, conds)!
 				}
 			}
 		}
@@ -342,6 +379,13 @@ pub fn (qb_ &QueryBuilder[T]) select(fields ...string) !&QueryBuilder[T] {
 	return qb
 }
 
+// distinct marks the query as `SELECT DISTINCT`.
+pub fn (qb_ &QueryBuilder[T]) distinct() !&QueryBuilder[T] {
+	mut qb := unsafe { qb_ }
+	qb.config.has_distinct = true
+	return qb
+}
+
 // set create a `set` clause for `update`
 pub fn (qb_ &QueryBuilder[T]) set(assign string, values ...Primitive) !&QueryBuilder[T] {
 	mut qb := unsafe { qb_ }
@@ -376,7 +420,7 @@ pub fn (qb_ &QueryBuilder[T]) set(assign string, values ...Primitive) !&QueryBui
 }
 
 // table_from_struct get table from struct
-fn table_from_struct[T]() Table {
+fn table_from_struct[T](meta []TableField) Table {
 	mut table_name := T.name
 	// Strip generic parameters from type name (e.g., Message[Payload] -> Message)
 	if bracket_pos := table_name.index('[') {
@@ -396,8 +440,10 @@ fn table_from_struct[T]() Table {
 		table_name = table_name.to_lower()
 	}
 	return Table{
-		name:  table_name
-		attrs: attrs
+		name:    table_name
+		attrs:   attrs
+		fields:  meta.map(it.name)
+		columns: meta.map(sql_field_name(it))
 	}
 }
 
@@ -748,6 +794,7 @@ fn (qb &QueryBuilder[T]) validate_aggregate_field(kind AggregateKind, field stri
 					.avg { '${@FN}(): `avg` requires a numeric field' }
 					else { '${@FN}(): aggregate requires a numeric field' }
 				}
+
 				return error(msg)
 			}
 		}
@@ -758,11 +805,13 @@ fn (qb &QueryBuilder[T]) validate_aggregate_field(kind AggregateKind, field stri
 					.max { '${@FN}(): `max` requires a numeric, string, or time.Time field' }
 					else { '${@FN}(): aggregate requires a numeric, string, or time.Time field' }
 				}
+
 				return error(msg)
 			}
 		}
 		else {}
 	}
+
 	return meta_field
 }
 
@@ -969,6 +1018,7 @@ pub fn (qb_ &QueryBuilder[T]) insert[T](value T) !&QueryBuilder[T] {
 }
 
 // insert_many insert records into the database
+// Uses batch INSERT for efficiency when inserting multiple records.
 pub fn (qb_ &QueryBuilder[T]) insert_many[T](values []T) !&QueryBuilder[T] {
 	mut qb := unsafe { qb_ }
 	defer {
@@ -978,11 +1028,70 @@ pub fn (qb_ &QueryBuilder[T]) insert_many[T](values []T) !&QueryBuilder[T] {
 	if values.len == 0 {
 		return error('${@FN}(): `insert` need at least one record')
 	}
-	for value in values {
-		new_qb := fill_data_with_struct[T](value, qb.meta)
-		qb.conn.insert(qb.config.table, new_qb)!
+	mut batch := fill_data_with_struct[T](values[0], qb.meta)
+	batch.batch_rows = values.len
+	for i in 1 .. values.len {
+		next := fill_data_with_struct[T](values[i], qb.meta)
+		for d in next.data {
+			batch.data << d
+		}
 	}
+	qb.conn.insert(qb.config.table, batch)!
 	return qb
+}
+
+// save updates all mapped fields in `value` using the struct primary key or `id` field.
+pub fn save[T](conn Connection, value T) ! {
+	mut qb := new_query[T](conn)
+	data, where := build_save_query_data[T](qb.meta, qb.config.table.name, value)!
+	qb.conn.update(qb.config.table, data, where)!
+}
+
+fn build_save_query_data[T](meta []TableField, table_name string, value T) !(QueryData, QueryData) {
+	data := fill_data_with_struct[T](value, meta)
+	if data.fields.len != data.data.len {
+		return error('${@FN}(): table `${table_name}` contains fields that `save` cannot map automatically')
+	}
+	primary_field_name := find_save_primary_field_name(meta) or {
+		return error('${@FN}(): table `${table_name}` needs a primary key or `id` field to use `save`')
+	}
+	mut update_data := QueryData{}
+	mut where_data := QueryData{
+		kinds: [.eq]
+	}
+	for i, field_name in data.fields {
+		if field_name == primary_field_name {
+			where_data.fields << field_name
+			where_data.data << data.data[i]
+			continue
+		}
+		update_data.fields << field_name
+		update_data.data << data.data[i]
+	}
+	if where_data.fields.len == 0 {
+		return error('${@FN}(): struct value is missing the primary key field `${primary_field_name}`')
+	}
+	if update_data.fields.len == 0 {
+		return error('${@FN}(): no updatable fields were found for table `${table_name}`')
+	}
+	return update_data, where_data
+}
+
+fn find_save_primary_field_name(meta []TableField) ?string {
+	for field in meta {
+		for attr in field.attrs {
+			if attr_name_matches(attr.name, 'primary') {
+				return sql_field_name(field)
+			}
+		}
+	}
+	for field in meta {
+		field_name := sql_field_name(field)
+		if field.name == 'id' || field_name == 'id' {
+			return field_name
+		}
+	}
+	return none
 }
 
 fn fill_data_with_struct[T](value T, meta []TableField) QueryData {
@@ -1096,6 +1205,75 @@ pub fn (qb_ &QueryBuilder[T]) update() !&QueryBuilder[T] {
 	}
 	qb.conn.update(qb.config.table, qb.data, qb.where)!
 	return qb
+}
+
+// update_many updates multiple records by a key field, using batch CASE WHEN for efficiency.
+// key_field is the column used to match rows (e.g. 'id').
+// field_names selects which columns to update; if empty, all struct fields except key_field are updated.
+pub fn update_many[T](mut conn Connection, values []T, key_field string, field_names ...string) ! {
+	if values.len == 0 {
+		return error('${@FN}(): need at least one record')
+	}
+	mut qb := new_query[T](conn)
+
+	// Build the field list from the first value
+	first := fill_data_with_struct[T](values[0], qb.meta)
+	mut key_index := -1
+	mut value_fields := []string{}
+	mut value_indexes := []int{}
+
+	for i, field in first.fields {
+		if field == key_field {
+			key_index = i
+		} else if field_names.len == 0 || field in field_names {
+			value_fields << field
+			value_indexes << i
+		}
+	}
+
+	if key_index < 0 {
+		return error('${@FN}(): key field `${key_field}` not found in table `${qb.config.table.name}`')
+	}
+
+	if value_fields.len == 0 {
+		return error('${@FN}(): no updatable fields found for table `${qb.config.table.name}`')
+	}
+
+	mut update_data := QueryData{
+		fields:     value_fields
+		batch_rows: values.len
+		batch_key:  key_field
+	}
+
+	// Build data: per value_field, per row: [key_value, value_field_value]
+	rows := values.map(fill_data_with_struct[T](it, qb.meta))
+
+	for fj in value_indexes {
+		for row in rows {
+			if key_index < row.data.len {
+				update_data.data << row.data[key_index]
+			}
+			if fj < row.data.len {
+				update_data.data << row.data[fj]
+			}
+		}
+	}
+
+	// Build WHERE clause using IN
+	mut key_values := []Primitive{}
+	for row in rows {
+		if key_index < row.data.len {
+			key_values << row.data[key_index]
+		}
+	}
+
+	mut where_data := QueryData{
+		fields: [key_field]
+		data:   [Primitive(key_values)]
+		kinds:  [.in]
+	}
+
+	conn.update(qb.config.table, update_data, where_data)!
 }
 
 // delete delete record(s) in the database

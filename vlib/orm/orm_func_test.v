@@ -83,8 +83,8 @@ fn test_orm_func_where() {
 
 	// and_or_combination
 	qb.reset()
-	qb.where('name = ? AND status = ? OR role = ? || id = ? && title = ?', 'Alice', 1,
-		'admin', 1, 'st')!
+	qb.where('name = ? AND status = ? OR role = ? || id = ? && title = ?', 'Alice', 1, 'admin', 1,
+		'st')!
 	assert qb.where.fields == ['name', 'status', 'role', 'id', 'title']
 	assert qb.where.kinds == [.eq, .eq, .eq, .eq, .eq]
 	assert qb.where.is_and == [true, false, false, true]
@@ -116,6 +116,20 @@ fn test_orm_func_where() {
 	qb.where('name in ? AND age not in ?', ['Tom'], [2])!
 	assert qb.where.fields == ['name', 'age']
 	assert qb.where.kinds == [.in, .not_in]
+
+	// variable arrays for in and not in
+	names := ['Tom']
+	ages := [2]
+	qb.reset()
+	qb.where('name IN ? AND age NOT IN ?', names, ages)!
+	assert qb.where.fields == ['name', 'age']
+	assert qb.where.kinds == [.in, .not_in]
+	assert qb.where.data[0] is []orm.Primitive
+	assert qb.where.data[1] is []orm.Primitive
+	name_params := qb.where.data[0] as []orm.Primitive
+	age_params := qb.where.data[1] as []orm.Primitive
+	assert name_params == [orm.Primitive('Tom')]
+	assert age_params == [orm.Primitive(2)]
 }
 
 fn test_orm_func_stmts() {
@@ -506,6 +520,13 @@ fn test_orm_func_stmts() {
 	assert only_names[0].score == 0
 	assert only_names[0].created_at == none
 
+	// select distinct `role` from table
+	distinct_roles := qb.select('role')!.distinct()!.order(.asc, 'role')!.query()!
+	assert distinct_roles.len == 3
+	assert distinct_roles.map(it.role) == ['admin', 'employee', 'employer']
+	assert distinct_roles[0].id == 0
+	assert distinct_roles[0].name == ''
+
 	// update with single `set()`
 	qb.set('age = ?, title = ?', 71, 'boss')!.where('name = ?', 'John')!.update()!
 	john := qb.where('name = ?', 'John')!.query()!
@@ -635,6 +656,103 @@ fn test_orm_func_invalid_index_field_name2() {
 
 	qb.create() or {
 		assert err.msg() == "table `invalidindexfieldname2` has no field's name: `age_f32`"
+		return
+	}
+	assert false, 'should not be here'
+}
+
+fn test_orm_func_update_many() {
+	mut db := sqlite.connect(':memory:')!
+	defer { db.close() or {} }
+	mut qb := orm.new_query[User](db)
+
+	qb.create()!
+
+	// Insert test records
+	users := [
+		User{
+			name: 'Alice'
+			age:  25
+			role: 'developer'
+		},
+		User{
+			name: 'Bob'
+			age:  30
+			role: 'manager'
+		},
+		User{
+			name: 'Carol'
+			age:  35
+			role: 'designer'
+		},
+	]
+	qb.insert_many(users)!
+
+	// Verify initial data
+	all_users := qb.query()!
+	assert all_users.len == 3
+	assert all_users[0].name == 'Alice'
+	assert all_users[1].name == 'Bob'
+	assert all_users[2].name == 'Carol'
+
+	// Batch update names by id
+	orm.update_many[User](mut db, [
+		User{
+			id:   1
+			name: 'Alice_updated'
+			age:  26
+		},
+		User{
+			id:   2
+			name: 'Bob_updated'
+			age:  31
+		},
+	], 'id', 'name', 'age')!
+
+	// Verify updated data
+	updated_users := qb.query()!
+	assert updated_users.len == 3
+	for u in updated_users {
+		match u.id {
+			1 {
+				assert u.name == 'Alice_updated'
+				assert u.age == 26
+				assert u.role == 'developer'
+			}
+			2 {
+				assert u.name == 'Bob_updated'
+				assert u.age == 31
+				assert u.role == 'manager'
+			}
+			3 {
+				assert u.name == 'Carol'
+				assert u.age == 35
+				assert u.role == 'designer'
+			}
+			else {
+				assert false
+			}
+		}
+	}
+
+	// Test update_many with single record
+	orm.update_many[User](mut db, [
+		User{
+			id:   3
+			name: 'Carol_updated'
+			age:  36
+		},
+	], 'id', 'name', 'age')!
+
+	single_result := qb.where('id = ?', 3)!.query()!
+	assert single_result.len == 1
+	assert single_result[0].name == 'Carol_updated'
+	assert single_result[0].age == 36
+	assert single_result[0].role == 'designer'
+
+	// Test update_many with empty values
+	orm.update_many[User](mut db, []User{}, 'id', 'name') or {
+		assert err.msg().contains('need at least one record')
 		return
 	}
 	assert false, 'should not be here'

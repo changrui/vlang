@@ -25,19 +25,34 @@ mut:
 
 pub const default_server_port = 9009
 
+pub const default_https_server_port = 9043
+
 pub struct Server {
 mut:
-	state ServerStatus = .closed
+	state           ServerStatus = .closed
+	listener_opened bool
 pub mut:
 	addr                    string        = ':${default_server_port}'
 	handler                 Handler       = DebugHandler{}
 	read_timeout            time.Duration = 30 * time.second
 	write_timeout           time.Duration = 30 * time.second
 	accept_timeout          time.Duration = 30 * time.second
+	tls_handshake_timeout   time.Duration = 30 * time.second // fallback handshake budget used when accept_timeout is zero or net.infinite_timeout; ignored on non-TLS servers
 	pool_channel_slots      int           = 1024
 	worker_num              int           = runtime.nr_jobs()
 	max_keep_alive_requests int           = 100 // max requests per keep-alive connection (0 = unlimited)
 	listener                net.TcpListener
+
+	// TLS termination: when both `cert` and `cert_key` are set, the server
+	// accepts HTTPS connections instead of plain HTTP. With
+	// `in_memory_verification = true`, `cert` and `cert_key` are PEM strings;
+	// otherwise they are filesystem paths. Currently implemented on the
+	// default mbedtls backend; building with `-d use_openssl` reports a clear
+	// runtime error from listen_and_serve.
+	cert                   string
+	cert_key               string
+	in_memory_verification bool
+	enable_http2           bool // opt in to HTTP/2 on the TLS listener: advertises ALPN `h2, http/1.1`. Clients that select `h2` are served by the HTTP/2 driver; clients that select `http/1.1` (or send no ALPN) keep the existing HTTP/1.1 path.
 
 	on_running fn (mut s Server) = unsafe { nil } // Blocking cb. If set, ran by the web server on transitions to its .running state.
 	on_stopped fn (mut s Server) = unsafe { nil } // Blocking cb. If set, ran by the web server on transitions to its .stopped state.
@@ -51,6 +66,11 @@ pub mut:
 pub fn (mut s Server) listen_and_serve() {
 	if s.handler is DebugHandler {
 		eprintln('Server handler not set, using debug handler')
+	}
+
+	if s.cert != '' && s.cert_key != '' {
+		s.listen_and_serve_tls()
+		return
 	}
 
 	mut l := s.listener.addr() or {
@@ -71,6 +91,7 @@ pub fn (mut s Server) listen_and_serve() {
 		}
 	}
 	s.addr = l.str()
+	s.listener_opened = true
 	s.listener.set_accept_timeout(s.accept_timeout)
 
 	// Create tcp connection channel
@@ -122,7 +143,10 @@ pub fn (mut s Server) stop() {
 @[inline]
 pub fn (mut s Server) close() {
 	s.state = .closed
-	s.listener.close() or { return }
+	if s.listener_opened {
+		s.listener.close() or { return }
+		s.listener_opened = false
+	}
 	if s.on_closed != unsafe { nil } {
 		s.on_closed(mut s)
 	}
@@ -276,6 +300,7 @@ fn normalize_server_response(mut resp Response, req Request) {
 			resp.set_version(server_version)
 		}
 	}
+
 	status := status_from_int(resp.status_code)
 	if status.is_valid() {
 		if resp.status_msg == '' {
